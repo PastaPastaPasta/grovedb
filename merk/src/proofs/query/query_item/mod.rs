@@ -279,8 +279,8 @@ impl Encode for QueryItem {
 }
 
 #[cfg(any(feature = "minimal", feature = "verify"))]
-impl Decode for QueryItem {
-    fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<Self, DecodeError> {
+impl Decode<()> for QueryItem {
+    fn decode<D: bincode::de::Decoder<Context = ()>>(decoder: &mut D) -> Result<Self, DecodeError> {
         let variant_id = u8::decode(decoder)?;
 
         match variant_id {
@@ -335,8 +335,8 @@ impl Decode for QueryItem {
 }
 
 #[cfg(any(feature = "minimal", feature = "verify"))]
-impl<'de> BorrowDecode<'de> for QueryItem {
-    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(
+impl<'de> BorrowDecode<'de, ()> for QueryItem {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = ()>>(
         decoder: &mut D,
     ) -> Result<Self, DecodeError> {
         let variant_id = u8::decode(decoder)?;
