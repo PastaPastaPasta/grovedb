@@ -52,14 +52,29 @@ impl<'a> Decoder<'a> {
 impl Iterator for Decoder<'_> {
     type Item = Result<Op, crate::error::Error>;
 
+    // `match` rather than `Option::map`, to keep closures off the verifier
+    // path.
+    #[allow(clippy::manual_map)]
     fn next(&mut self) -> Option<Self::Item> {
         match self.inner.next_core() {
             None => None,
-            Some(Ok(op)) => Some(Ok(op)),
-            Some(Err(e)) => Some(Err(crate::error::Error::InvalidProofError(
-                grovedb_query::proofs::op_decode_error_message(&e),
-            ))),
+            Some(item) => Some(merk_decode_item(item)),
         }
+    }
+}
+
+/// One decoded item with its error mapped to `Error::InvalidProofError`
+/// (the message `op_decode_error_message` gives). A function of its own so
+/// `next` moves the whole item out of `next_core`'s result.
+#[cfg(any(feature = "minimal", feature = "verify"))]
+fn merk_decode_item(
+    item: Result<Op, grovedb_query::proofs::OpDecodeError>,
+) -> Result<Op, crate::error::Error> {
+    match item {
+        Ok(op) => Ok(op),
+        Err(e) => Err(crate::error::Error::InvalidProofError(
+            grovedb_query::proofs::op_decode_error_message(&e),
+        )),
     }
 }
 
