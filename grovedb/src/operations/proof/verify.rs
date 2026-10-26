@@ -162,6 +162,32 @@ fn path_to_owned(path: &[&[u8]]) -> Vec<Vec<u8>> {
     owned
 }
 
+/// Whether no axis of a `ProvableCountProvableSumIndexedTree` has a
+/// secondary root key, i.e. `axes.iter().all(|(_, sk)| sk.is_none())` as an
+/// index loop (`true` for an empty list).
+fn all_axes_unset(axes: &[(u8, Option<Vec<u8>>)]) -> bool {
+    let mut i = 0;
+    while i < axes.len() {
+        if axes[i].1.is_some() {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Each axis tag paired with `NULL_HASH`, in order, i.e.
+/// `axes.iter().map(|(t, _)| (*t, NULL_HASH)).collect()` as an index loop.
+fn null_axis_hashes(axes: &[(u8, Option<Vec<u8>>)]) -> Vec<(u8, CryptoHash)> {
+    let mut hashes = Vec::with_capacity(axes.len());
+    let mut i = 0;
+    while i < axes.len() {
+        hashes.push((axes[i].0, NULL_HASH));
+        i += 1;
+    }
+    hashes
+}
+
 impl GroveDb {
     /// Verifies a proof against a path query with the given options, returning
     /// the root hash and deserialized results.
@@ -911,10 +937,9 @@ impl GroveDb {
                         combine_hash_three(&value_h, &NULL_HASH, &NULL_HASH).unwrap()
                     }
                     Element::ProvableCountProvableSumIndexedTree(None, 0, 0, axes, _)
-                        if axes.iter().all(|(_, sk)| sk.is_none()) =>
+                        if all_axes_unset(axes) =>
                     {
-                        let zero_axes: Vec<(u8, grovedb_merk::CryptoHash)> =
-                            axes.iter().map(|(t, _)| (*t, NULL_HASH)).collect();
+                        let zero_axes: Vec<(u8, grovedb_merk::CryptoHash)> = null_axis_hashes(axes);
                         let digest = axes_digest(&zero_axes).unwrap();
                         combine_hash_three(&value_h, &NULL_HASH, &digest).unwrap()
                     }
@@ -2708,10 +2733,9 @@ impl GroveDb {
                     .to_owned(),
             ),
             Element::ProvableCountProvableSumIndexedTree(None, 0, 0, axes, _)
-                if axes.iter().all(|(_, sk)| sk.is_none()) =>
+                if all_axes_unset(axes) =>
             {
-                let zero_axes: Vec<(u8, CryptoHash)> =
-                    axes.iter().map(|(t, _)| (*t, NULL_HASH)).collect();
+                let zero_axes: Vec<(u8, CryptoHash)> = null_axis_hashes(axes);
                 let digest = axes_digest(&zero_axes).value().to_owned();
                 Some(
                     combine_hash_three(value_hash(value_bytes).value(), &NULL_HASH, &digest)
@@ -4829,5 +4853,49 @@ impl GroveDb {
             branch_root_hash,
             tree: branch_tree,
         })
+    }
+}
+
+#[cfg(test)]
+mod axis_helper_tests {
+    use super::*;
+
+    /// Every axes list of length 0..=4 over three tags and three secondary
+    /// key shapes (absent, empty, non-empty).
+    fn every_axes_list() -> Vec<Vec<(u8, Option<Vec<u8>>)>> {
+        let entries: Vec<(u8, Option<Vec<u8>>)> = [0u8, 1, 2]
+            .into_iter()
+            .flat_map(|t| [(t, None), (t, Some(Vec::new())), (t, Some(vec![7]))])
+            .collect();
+        let mut lists = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for list in &frontier {
+                for entry in &entries {
+                    let mut extended: Vec<(u8, Option<Vec<u8>>)> = list.clone();
+                    extended.push(entry.clone());
+                    next.push(extended);
+                }
+            }
+            lists.extend(next.iter().cloned());
+            frontier = next;
+        }
+        lists
+    }
+
+    #[test]
+    fn axis_helpers_match_iterator_forms() {
+        let lists = every_axes_list();
+        assert_eq!(lists.len(), 1 + 9 + 81 + 729 + 6561);
+        for axes in &lists {
+            assert_eq!(
+                all_axes_unset(axes),
+                axes.iter().all(|(_, sk)| sk.is_none()),
+                "{axes:?}"
+            );
+            let old: Vec<(u8, CryptoHash)> = axes.iter().map(|(t, _)| (*t, NULL_HASH)).collect();
+            assert_eq!(null_axis_hashes(axes), old, "{axes:?}");
+        }
     }
 }

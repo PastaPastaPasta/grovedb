@@ -542,7 +542,14 @@ impl Element {
     fn has_pcpsit_with_any_secondary(&self) -> bool {
         match self.underlying() {
             Element::ProvableCountProvableSumIndexedTree(_, _, _, axes, _) => {
-                axes.iter().any(|(_, sk)| sk.is_some())
+                let mut i = 0;
+                while i < axes.len() {
+                    if axes[i].1.is_some() {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
             }
             _ => false,
         }
@@ -2284,5 +2291,42 @@ impl Element {
             _ => {}
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pcpsit_secondary_tests {
+    use crate::element::Element;
+
+    #[test]
+    fn has_pcpsit_with_any_secondary_matches_iterator_form() {
+        let entries: Vec<(u8, Option<Vec<u8>>)> = [0u8, 1, 2]
+            .into_iter()
+            .flat_map(|t| [(t, None), (t, Some(Vec::new())), (t, Some(vec![7]))])
+            .collect();
+        let mut lists: Vec<Vec<(u8, Option<Vec<u8>>)>> = vec![Vec::new()];
+        let mut frontier = vec![Vec::new()];
+        for _ in 0..4 {
+            let mut next = Vec::new();
+            for list in &frontier {
+                for entry in &entries {
+                    let mut extended: Vec<(u8, Option<Vec<u8>>)> = list.clone();
+                    extended.push(entry.clone());
+                    next.push(extended);
+                }
+            }
+            lists.extend(next.iter().cloned());
+            frontier = next;
+        }
+        assert_eq!(lists.len(), 1 + 9 + 81 + 729 + 6561);
+        for axes in lists {
+            let old = axes.iter().any(|(_, sk)| sk.is_some());
+            let element = Element::ProvableCountProvableSumIndexedTree(None, 0, 0, axes, None);
+            assert_eq!(element.has_pcpsit_with_any_secondary(), old, "{element:?}");
+            // Looks through `NonCounted` as before.
+            let wrapped = Element::NonCounted(Box::new(element));
+            assert_eq!(wrapped.has_pcpsit_with_any_secondary(), old, "{wrapped:?}");
+        }
+        assert!(!Element::Tree(Some(vec![1]), None).has_pcpsit_with_any_secondary());
     }
 }
