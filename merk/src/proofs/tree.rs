@@ -674,6 +674,32 @@ impl<'a> Iterator for LayerIter<'a> {
 }
 
 #[cfg(any(feature = "minimal", feature = "verify"))]
+/// The key a pushed node reveals, if it reveals one: the sixteen key-bearing
+/// `Node` variants (the same set as [`Tree::key`]). Proof execution checks
+/// these keys are strictly ordered in push order.
+pub(crate) fn node_key(node: &Node) -> Option<&Vec<u8>> {
+    match node {
+        Node::KV(key, _)
+        | Node::KVValueHash(key, ..)
+        | Node::KVValueHashFeatureType(key, ..)
+        | Node::KVValueHashFeatureTypeWithChildHash(key, ..)
+        | Node::KVRefValueHash(key, ..)
+        | Node::KVCount(key, ..)
+        | Node::KVRefValueHashCount(key, ..)
+        | Node::KVDigest(key, _)
+        | Node::KVDigestCount(key, ..)
+        | Node::KVSum(key, ..)
+        | Node::KVDigestSum(key, ..)
+        | Node::KVRefValueHashSum(key, ..)
+        | Node::KVCountSum(key, ..)
+        | Node::KVDigestCountSum(key, ..)
+        | Node::KVRefValueHashCountSum(key, ..)
+        | Node::KVBackwardsReferencesValueHash(key, ..) => Some(key),
+        _ => None,
+    }
+}
+
+#[cfg(any(feature = "minimal", feature = "verify"))]
 /// Maximum number of operations allowed in a single proof execution.
 ///
 /// This prevents denial-of-service via crafted proofs with millions of
@@ -889,23 +915,7 @@ where
             }
             Op::Push(node) => {
                 // Check key ordering for ALL node types that contain keys
-                if let Node::KV(key, _)
-                | Node::KVValueHash(key, ..)
-                | Node::KVValueHashFeatureType(key, ..)
-                | Node::KVValueHashFeatureTypeWithChildHash(key, ..)
-                | Node::KVRefValueHash(key, ..)
-                | Node::KVCount(key, ..)
-                | Node::KVRefValueHashCount(key, ..)
-                | Node::KVDigest(key, _)
-                | Node::KVDigestCount(key, ..)
-                | Node::KVSum(key, ..)
-                | Node::KVDigestSum(key, ..)
-                | Node::KVRefValueHashSum(key, ..)
-                | Node::KVCountSum(key, ..)
-                | Node::KVDigestCountSum(key, ..)
-                | Node::KVRefValueHashCountSum(key, ..)
-                | Node::KVBackwardsReferencesValueHash(key, ..) = &node
-                {
+                if let Some(key) = node_key(&node) {
                     // keys should always increase
                     if let Some(last_key) = &maybe_last_key
                         && key <= last_key
@@ -934,23 +944,7 @@ where
             }
             Op::PushInverted(node) => {
                 // Check key ordering for ALL node types that contain keys
-                if let Node::KV(key, _)
-                | Node::KVValueHash(key, ..)
-                | Node::KVValueHashFeatureType(key, ..)
-                | Node::KVValueHashFeatureTypeWithChildHash(key, ..)
-                | Node::KVRefValueHash(key, ..)
-                | Node::KVCount(key, ..)
-                | Node::KVRefValueHashCount(key, ..)
-                | Node::KVDigest(key, _)
-                | Node::KVDigestCount(key, ..)
-                | Node::KVSum(key, ..)
-                | Node::KVDigestSum(key, ..)
-                | Node::KVRefValueHashSum(key, ..)
-                | Node::KVCountSum(key, ..)
-                | Node::KVDigestCountSum(key, ..)
-                | Node::KVRefValueHashCountSum(key, ..)
-                | Node::KVBackwardsReferencesValueHash(key, ..) = &node
-                {
+                if let Some(key) = node_key(&node) {
                     // keys should always decrease
                     if let Some(last_key) = &maybe_last_key
                         && key >= last_key
