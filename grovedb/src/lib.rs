@@ -167,6 +167,7 @@ mod tests;
 #[cfg(feature = "minimal")]
 mod util;
 #[cfg(feature = "verify-extraction")]
+#[doc(hidden)]
 pub mod verify_extraction;
 #[cfg(feature = "minimal")]
 mod visualize;
