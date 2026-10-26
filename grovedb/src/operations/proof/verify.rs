@@ -118,8 +118,8 @@ impl ParentCommitment<'_> {
 
     fn bind(&self, query: &PathQuery, lower_hash: &CryptoHash) -> Result<(), Error> {
         self.check(lower_hash).map_err(|combined_root_hash| {
-            Error::InvalidProof(
-                query.clone(),
+            invalid_proof(
+                query,
                 format!(
                     "V1 mismatch in lower layer hash, expected {}, got {}",
                     hex::encode(self.value_hash),
@@ -128,6 +128,26 @@ impl ParentCommitment<'_> {
             )
         })
     }
+}
+
+/// `Error::InvalidProof` for a V1 verifier rejection. Out of line so the
+/// verifier clones the query only on the error path.
+#[cold]
+fn invalid_proof(query: &PathQuery, message: String) -> Error {
+    Error::InvalidProof(query.clone(), message)
+}
+
+/// `Error::CorruptedPath` for a V1 layer whose `path` is not part of
+/// `query`; `context` prefixes the message. Out of line so the message is
+/// formatted only on the error path.
+#[cold]
+fn corrupted_layer_path(context: &str, path: &[&[u8]], query: &PathQuery) -> Error {
+    Error::CorruptedPath(format!(
+        "{}: path {} should be part of path_query {}",
+        context,
+        path.iter().map(hex::encode).collect::<Vec<_>>().join("/"),
+        query
+    ))
 }
 
 impl GroveDb {
@@ -670,17 +690,16 @@ impl GroveDb {
         let inner_range = query.validate_count_offset_paginated()?.clone();
         let offset = query.query.offset.map(|o| o as u64).unwrap_or(0);
         let limit_u64 = query.query.limit.map(|l| l as u64);
-        let internal_query_for_dir = query
-            .query_items_at_path(current_path, grove_version)?
-            .ok_or(Error::CorruptedPath(format!(
-                "count-offset verify: path {} should be part of path_query {}",
-                current_path
-                    .iter()
-                    .map(hex::encode)
-                    .collect::<Vec<_>>()
-                    .join("/"),
-                query
-            )))?;
+        let internal_query_for_dir = match query.query_items_at_path(current_path, grove_version)? {
+            Some(internal_query) => internal_query,
+            None => {
+                return Err(corrupted_layer_path(
+                    "count-offset verify",
+                    current_path,
+                    query,
+                ))
+            }
+        };
 
         // The validator rejects subqueries, so an honest count-offset
         // leaf proof always has empty `lower_layers`. A non-empty
@@ -689,8 +708,8 @@ impl GroveDb {
         // succinctness post-pass would not catch because we
         // short-circuit before it runs).
         if !lower_layers_empty {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "count-offset leaf proof has unexpected lower_layers — \
                  validate_count_offset_paginated disallows subqueries, so \
                  no child layers should be present"
@@ -707,8 +726,8 @@ impl GroveDb {
         )
         .unwrap()
         .map_err(|e| {
-            Error::InvalidProof(
-                query.clone(),
+            invalid_proof(
+                query,
                 format!("count-offset merk proof failed to verify: {}", e),
             )
         })?;
@@ -751,8 +770,8 @@ impl GroveDb {
             // `result.push` below, surfacing the unparsed bytes to the
             // caller.
             let elem = Element::deserialize(item.value.as_slice(), grove_version).map_err(|e| {
-                Error::InvalidProof(
-                    query.clone(),
+                invalid_proof(
+                    query,
                     format!(
                         "count-offset paginated proof returned non-Element bytes at \
                          key {}: {e}",
@@ -777,8 +796,8 @@ impl GroveDb {
             // flags those rows, and the wrapper is looked through below
             // like everywhere else.
             if elem.is_non_counted() && !item.resolved_from_reference {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     format!(
                         "count-offset paginated proofs do not surface \
                          NonCounted-wrapped entries in returned items — proof at \
@@ -802,8 +821,8 @@ impl GroveDb {
             // resolved. Seeing an unresolved reference here means the proof
             // skipped the post-pass — reject rather than surface it.
             if inner.is_reference() {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     format!(
                         "count-offset paginated proof surfaced a raw \
                          Reference / ReferenceWithSumItem at key {} — the prover's \
@@ -831,8 +850,8 @@ impl GroveDb {
             if !item.resolved_from_reference {
                 let element_type = inner.element_type();
                 if !(element_type.has_simple_value_hash() || element_type.is_tree()) {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         format!(
                             "count-offset paginated proof surfaced an element of type '{}' at key {}; \
                              a count tree's own rows are simple items or empty trees, and \
@@ -890,8 +909,8 @@ impl GroveDb {
                     _ => combine_hash(&value_h, &NULL_HASH).unwrap(),
                 };
                 if expected != item.value_hash {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         format!(
                             "count-offset paginated proof: empty-tree return at key {} \
                              has value_hash {} but expected {} — possible KV→KVValueHash \
@@ -936,8 +955,8 @@ impl GroveDb {
             | ProofBytes::CountIndexedTree(_)
             | ProofBytes::IndexedTreeTerminal(_)
             | ProofBytes::IndexedTreeAxisDescent(_)
-            | ProofBytes::SumBudgetWindow(_) => Err(Error::InvalidProof(
-                query.clone(),
+            | ProofBytes::SumBudgetWindow(_) => Err(invalid_proof(
+                query,
                 "Expected Merk proof at this layer, got non-Merk proof type".to_string(),
             )),
         }
@@ -1002,24 +1021,24 @@ impl GroveDb {
         }
 
         let ProofBytes::IndexedTreeAxisDescent(payload_bytes) = &lower_layer.merk_proof else {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "the query node at this indexed tree is an axis read; its lower layer must \
                  carry ProofBytes::IndexedTreeAxisDescent"
                     .to_string(),
             ));
         };
         if !lower_layer.lower_layers.is_empty() {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "an axis descent is terminal and must not carry further lower layers".to_string(),
             ));
         }
         let payload = AxisDescentProof::decode_canonical(payload_bytes)?;
         let axis = axis_query.axis;
         if payload.axis_tag != axis.tag() {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "axis descent payload claims axis tag {} but the query reads axis {:?}",
                     payload.axis_tag, axis
@@ -1029,8 +1048,8 @@ impl GroveDb {
         if payload.rank.is_some()
             && !matches!(axis_query.traversal, AxisTraversal::RankOfKey { .. })
         {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "axis descent payload carries a rank but the traversal is not RankOfKey"
                     .to_string(),
             ));
@@ -1050,8 +1069,8 @@ impl GroveDb {
                 )
                 .unwrap()
                 .map_err(|e| {
-                    Error::InvalidProof(
-                        query.clone(),
+                    invalid_proof(
+                        query,
                         format!("axis descent: secondary count-offset proof failed: {e}"),
                     )
                 })?;
@@ -1071,8 +1090,8 @@ impl GroveDb {
             }
             AxisTraversal::RankOfKey { key } => {
                 let Some(rank) = payload.rank else {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         "axis descent for a rank-of-key traversal must carry the rank".to_string(),
                     ));
                 };
@@ -1086,8 +1105,8 @@ impl GroveDb {
                 )
                 .unwrap()
                 .map_err(|e| {
-                    Error::InvalidProof(
-                        query.clone(),
+                    invalid_proof(
+                        query,
                         format!("axis descent: rank count-offset proof failed: {e}"),
                     )
                 })?;
@@ -1096,8 +1115,8 @@ impl GroveDb {
                 // out"), and the single yielded entry must be the
                 // queried key.
                 if res.skipped != rank {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         format!(
                             "axis descent: claimed rank {rank} but the count commitments \
                              attest {} skipped entries",
@@ -1113,8 +1132,8 @@ impl GroveDb {
                 )?;
                 let yielded_key = entries.first_original_key().map(|k| k.to_vec());
                 if yielded_key.as_deref() != Some(key.as_slice()) {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         format!(
                             "axis descent: the entry at rank {rank} is {:?}, not the queried \
                              key {}",
@@ -1163,8 +1182,8 @@ impl GroveDb {
                         )
                         .unwrap()
                         .map_err(|e| {
-                            Error::InvalidProof(
-                                query.clone(),
+                            invalid_proof(
+                                query,
                                 format!("axis descent: secondary range proof failed: {e}"),
                             )
                         })?;
@@ -1197,8 +1216,8 @@ impl GroveDb {
                         sum_aggregate_inner_range(*lo, *hi)
                     }
                     grovedb_merk::proofs::query::IndexAxis::Avg => {
-                        return Err(Error::InvalidProof(
-                            query.clone(),
+                        return Err(invalid_proof(
+                            query,
                             "axis descent: value-range aggregates are not defined for the \
                              Avg axis"
                                 .to_string(),
@@ -1213,8 +1232,8 @@ impl GroveDb {
                         )
                         .unwrap()
                         .map_err(|e| {
-                            Error::InvalidProof(
-                                query.clone(),
+                            invalid_proof(
+                                query,
                                 format!("axis descent: population proof failed: {e}"),
                             )
                         })?;
@@ -1232,10 +1251,7 @@ impl GroveDb {
                         )
                         .unwrap()
                         .map_err(|e| {
-                            Error::InvalidProof(
-                                query.clone(),
-                                format!("axis descent: total proof failed: {e}"),
-                            )
+                            invalid_proof(query, format!("axis descent: total proof failed: {e}"))
                         })?;
                         (root, AxisWalkResult::Aggregate { value: sum as i128 })
                     }
@@ -1263,8 +1279,8 @@ impl GroveDb {
         .value()
         .to_owned();
         if parent_committed_hash != &combined {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "axis descent binding mismatch: parent committed {}, recomputed {}",
                     hex::encode(parent_committed_hash),
@@ -1316,8 +1332,8 @@ impl GroveDb {
             ));
         }
         let Some(budget) = query.sum_budget_read_at_path(path).copied() else {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "the proof carries a sum-budget window at a path whose query node is not a \
                  sum-budget read"
                     .to_string(),
@@ -1347,8 +1363,8 @@ impl GroveDb {
             )
             .unwrap()
             .map_err(|e| {
-                Error::InvalidProof(
-                    query.clone(),
+                invalid_proof(
+                    query,
                     format!("sum-budget window proof failed to execute: {e}"),
                 )
             })?;
@@ -1367,8 +1383,8 @@ impl GroveDb {
             })
             .collect();
         if window.len() != payload.window_len as usize {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "sum-budget window claims {} scanned elements but the proof yields {}",
                     payload.window_len,
@@ -1394,8 +1410,8 @@ impl GroveDb {
             // window that continues past a fired stop hides where the
             // walk really ended.
             if remaining <= 0 || matches_left == Some(0) || hard_cap_tripped {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     "sum-budget window continues past its stop condition".to_string(),
                 ));
             }
@@ -1415,8 +1431,8 @@ impl GroveDb {
             // dropped.
             let simply_bound = value_hash(value_bytes).value() == *row_value_hash;
             if !simply_bound && !*child_hash_verified {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     format!(
                         "sum-budget window row {} presents element bytes the proof does not \
                          bind: a composite row must carry its child hash",
@@ -1454,8 +1470,8 @@ impl GroveDb {
                 | Element::SumItemWithBackwardsReferences(value, _, _)
                 | Element::ItemWithSumItemWithBackwardsReferences(_, value, _, _) => value,
                 _ => {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         "sum-budget window element passed the sum-item check but carries no \
                          sum value"
                             .to_string(),
@@ -1471,15 +1487,15 @@ impl GroveDb {
 
         let stop_fired = remaining <= 0 || matches_left == Some(0) || hard_cap_tripped;
         if payload.exhausted && stop_fired {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "sum-budget window claims exhaustion but a stop condition fired within it"
                     .to_string(),
             ));
         }
         if !payload.exhausted && !stop_fired {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "sum-budget window claims a stop condition but none fired within it — the \
                  window is short of the real stop"
                     .to_string(),
@@ -1535,8 +1551,8 @@ impl GroveDb {
         // #863 orientation check, which still refuses a mixed stream.
         let left_to_right = grovedb_merk::proofs::query::proof_stream_direction(merk_proof_bytes)
             .map_err(|e| {
-                Error::InvalidProof(
-                    query.clone(),
+                invalid_proof(
+                    query,
                     format!("Invalid V1 lower layer proof (root derivation): {}", e),
                 )
             })?
@@ -1545,8 +1561,8 @@ impl GroveDb {
             .execute_proof(merk_proof_bytes, None, left_to_right, PROOF_VERSION_LATEST)
             .unwrap()
             .map_err(|e| {
-                Error::InvalidProof(
-                    query.clone(),
+                invalid_proof(
+                    query,
                     format!("Invalid V1 lower layer proof (root derivation): {}", e),
                 )
             })?;
@@ -1584,8 +1600,8 @@ impl GroveDb {
         Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
     {
         if current_depth > super::MAX_PROOF_DEPTH {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "proof verification exceeded maximum depth limit".to_string(),
             ));
         }
@@ -1626,17 +1642,10 @@ impl GroveDb {
             return dispatch_result;
         }
 
-        let internal_query = query
-            .query_items_at_path(current_path, grove_version)?
-            .ok_or(Error::CorruptedPath(format!(
-                "verify v1: path {} should be part of path_query {}",
-                current_path
-                    .iter()
-                    .map(hex::encode)
-                    .collect::<Vec<_>>()
-                    .join("/"),
-                query
-            )))?;
+        let internal_query = match query.query_items_at_path(current_path, grove_version)? {
+            Some(internal_query) => internal_query,
+            None => return Err(corrupted_layer_path("verify v1", current_path, query)),
+        };
 
         // This frame's per-instance budget — fresh for this subtree,
         // bounded by every enclosing cap; `None` throughout on queries
@@ -1691,8 +1700,8 @@ impl GroveDb {
         let left_to_right = if single_key_synthesized_level {
             grovedb_merk::proofs::query::proof_stream_direction(merk_proof_bytes)
                 .map_err(|e| {
-                    Error::InvalidProof(
-                        query.clone(),
+                    invalid_proof(
+                        query,
                         format!("Invalid V1 proof op stream at path component layer: {}", e),
                     )
                 })?
@@ -1737,8 +1746,8 @@ impl GroveDb {
             )
             .unwrap()
             .map_err(|e| {
-                Error::InvalidProof(
-                    query.clone(),
+                invalid_proof(
+                    query,
                     format!("Invalid V1 proof verification parameters: {}", e),
                 )
             })?;
@@ -1782,8 +1791,8 @@ impl GroveDb {
                     // silently skip a descent the query asked for
                     // (issue #862).
                     if element.is_reference() {
-                        return Err(Error::InvalidProof(
-                            query.clone(),
+                        return Err(invalid_proof(
+                            query,
                             format!(
                                 "V1 proof surfaces a raw {} at key {}: the prover serves \
                                  references as KVRefValueHash nodes carrying the dereferenced \
@@ -1827,8 +1836,8 @@ impl GroveDb {
                     axis_path.push(key);
                     if let Some(axis_query) = query.axis_read_at_path(&axis_path) {
                         if !element.is_indexed_tree() {
-                            return Err(Error::InvalidProof(
-                                query.clone(),
+                            return Err(invalid_proof(
+                                query,
                                 format!(
                                     "V1 axis read at key {} resolves to a non-indexed \
                                      element ({}); an axis-ordered read has no meaning \
@@ -1840,8 +1849,8 @@ impl GroveDb {
                             ));
                         }
                         let Some(lower_layer) = lower_layers.get(key) else {
-                            return Err(Error::InvalidProof(
-                                query.clone(),
+                            return Err(invalid_proof(
+                                query,
                                 format!(
                                     "V1 axis read at key {} has no axis-descent lower \
                                      layer; the element cannot be reported as absent",
@@ -1907,8 +1916,8 @@ impl GroveDb {
                                     let ProofBytes::IndexedTreeTerminal(terminal_bytes) =
                                         &lower_layer.merk_proof
                                     else {
-                                        return Err(Error::InvalidProof(
-                                            query.clone(),
+                                        return Err(invalid_proof(
+                                            query,
                                             format!(
                                                 "V1 proof supplies a non-terminal lower layer for \
                                                  indexed tree at key {} with no query below it; \
@@ -1918,8 +1927,8 @@ impl GroveDb {
                                         ));
                                     };
                                     if !lower_layer.lower_layers.is_empty() {
-                                        return Err(Error::InvalidProof(
-                                            query.clone(),
+                                        return Err(invalid_proof(
+                                            query,
                                             format!(
                                                 "V1 indexed terminal attestation at key {} must \
                                                  not carry further lower layers",
@@ -1928,8 +1937,8 @@ impl GroveDb {
                                         ));
                                     }
                                     if terminal_bytes.len() != 64 {
-                                        return Err(Error::InvalidProof(
-                                            query.clone(),
+                                        return Err(invalid_proof(
+                                            query,
                                             format!(
                                                 "V1 indexed terminal attestation at key {} must \
                                                  be exactly 64 bytes (attestation || \
@@ -1952,8 +1961,8 @@ impl GroveDb {
                                     .value()
                                     .to_owned();
                                     if hash != &combined_root_hash {
-                                        return Err(Error::InvalidProof(
-                                            query.clone(),
+                                        return Err(invalid_proof(
+                                            query,
                                             format!(
                                                 "V1 mismatch in indexed terminal attestation at \
                                                  key {}, expected {}, got {}",
@@ -2012,8 +2021,8 @@ impl GroveDb {
                                     let cidx_bytes = match &lower_layer.merk_proof {
                                         ProofBytes::CountIndexedTree(b) => b,
                                         _ => {
-                                            return Err(Error::InvalidProof(
-                                                query.clone(),
+                                            return Err(invalid_proof(
+                                                query,
                                                 "V1 lower layer for CountIndexedTree element \
                                                  must use ProofBytes::CountIndexedTree"
                                                     .to_string(),
@@ -2021,8 +2030,8 @@ impl GroveDb {
                                         }
                                     };
                                     if cidx_bytes.len() < 32 {
-                                        return Err(Error::InvalidProof(
-                                            query.clone(),
+                                        return Err(invalid_proof(
+                                            query,
                                             "cidx proof bytes shorter than 32-byte secondary \
                                              root attestation prefix"
                                                 .to_string(),
@@ -2068,8 +2077,8 @@ impl GroveDb {
                                     .to_owned();
 
                                     if hash != &combined_root_hash {
-                                        return Err(Error::InvalidProof(
-                                            query.clone(),
+                                        return Err(invalid_proof(
+                                            query,
                                             format!(
                                                 "V1 mismatch in cidx lower-layer hash, \
                                                  expected {}, got {}",
@@ -2148,8 +2157,8 @@ impl GroveDb {
                                     // for this query (every `lower_layers.insert`
                                     // site is gated on there being a subquery
                                     // for the key). Reject as extra data.
-                                    return Err(Error::InvalidProof(
-                                        query.clone(),
+                                    return Err(invalid_proof(
+                                        query,
                                         format!(
                                             "V1 proof supplies a lower layer for tree at key {} \
                                              with no query below it; the element bytes would be \
@@ -2203,8 +2212,8 @@ impl GroveDb {
                                             // prover serve a read-mode query
                                             // as key selection.
                                             if query.sum_budget_read_at_path(&path).is_some() {
-                                                return Err(Error::InvalidProof(
-                                                    query.clone(),
+                                                return Err(invalid_proof(
+                                                    query,
                                                     "the query node at this tree is a \
                                                      sum-budget read; its lower layer must \
                                                      carry ProofBytes::SumBudgetWindow"
@@ -2237,8 +2246,8 @@ impl GroveDb {
                                         }
                                         ProofBytes::SumBudgetWindow(payload_bytes) => {
                                             if !lower_layer.lower_layers.is_empty() {
-                                                return Err(Error::InvalidProof(
-                                                    query.clone(),
+                                                return Err(invalid_proof(
+                                                    query,
                                                     "a sum-budget window is terminal and must \
                                                      not carry further lower layers"
                                                         .to_string(),
@@ -2391,8 +2400,8 @@ impl GroveDb {
                                             // a cidx-shaped lower layer on
                                             // a non-cidx parent element,
                                             // which is malformed.
-                                            return Err(Error::InvalidProof(
-                                                query.clone(),
+                                            return Err(invalid_proof(
+                                                query,
                                                 "indexed-tree proof envelope under a non-indexed \
                                                  parent element"
                                                     .to_string(),
@@ -2454,8 +2463,8 @@ impl GroveDb {
                             | Element::ItemWithBackwardsReferences(..)
                             | Element::SumItemWithBackwardsReferences(..)
                             | Element::ItemWithSumItemWithBackwardsReferences(..) => {
-                                return Err(Error::InvalidProof(
-                                    query.clone(),
+                                return Err(invalid_proof(
+                                    query,
                                     "V1 proof has lower layer for a non-tree element.".to_string(),
                                 ));
                             }
@@ -2518,8 +2527,8 @@ impl GroveDb {
                                 >= 1
                                 && element.is_non_empty_tree());
                         if requires_child_hash && !proved_key_value.child_hash_verified {
-                            return Err(Error::InvalidProof(
-                                query.clone(),
+                            return Err(invalid_proof(
+                                query,
                                 format!(
                                     "V1 non-empty tree at key {} without subquery must use \
                                      KVValueHashFeatureTypeWithChildHash proof node",
@@ -2583,8 +2592,8 @@ impl GroveDb {
                     } else if element.is_non_empty_tree()
                         && internal_query.has_subquery_or_matching_in_path_on_key(key)
                     {
-                        return Err(Error::InvalidProof(
-                            query.clone(),
+                        return Err(invalid_proof(
+                            query,
                             format!(
                                 "V1 proof is missing lower layer for non-empty tree at key {}",
                                 hex::encode(key),
@@ -2608,8 +2617,8 @@ impl GroveDb {
                         // silently skipped: the element bytes of a
                         // `KVValueHash*` node are unauthenticated until
                         // one of those paths binds them.
-                        return Err(Error::InvalidProof(
-                            query.clone(),
+                        return Err(invalid_proof(
+                            query,
                             format!(
                                 "V1 proof reports an element at key {} that is neither \
                                  descended into nor bound to the proof",
@@ -2626,8 +2635,8 @@ impl GroveDb {
         if options.verify_proof_succinctness {
             for key in lower_layers.keys() {
                 if !verified_keys.contains(key) {
-                    return Err(Error::InvalidProof(
-                        query.clone(),
+                    return Err(invalid_proof(
+                        query,
                         format!(
                             "V1 proof contains extra lower layer for key {} not required by query",
                             hex::encode(key),
@@ -2706,8 +2715,8 @@ impl GroveDb {
         };
         if let Some(expected_value_hash) = empty_indexed_expected {
             if hash != &expected_value_hash {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     format!(
                         "V1 empty indexed-tree value hash mismatch at key {}: expected {}, got {}",
                         hex::encode(key),
@@ -2729,8 +2738,8 @@ impl GroveDb {
             }
             let expected_value_hash = combine_hash(&element_hash, &NULL_HASH).value().to_owned();
             if hash != &expected_value_hash {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     format!(
                         "V1 empty tree value hash mismatch at key {}: expected {}, got {}",
                         hex::encode(key),
@@ -2767,8 +2776,8 @@ impl GroveDb {
         let element_mmr_size = match element {
             Element::MmrTree(mmr_size, ..) => *mmr_size,
             _ => {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     "MMR proof attached to non-MmrTree element".to_string(),
                 ));
             }
@@ -2779,8 +2788,8 @@ impl GroveDb {
 
         // Cross-validate: proof's mmr_size must match the element's mmr_size
         if mmr_proof.mmr_size() != element_mmr_size {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "MMR proof mmr_size {} does not match element mmr_size {}",
                     mmr_proof.mmr_size(),
@@ -2795,8 +2804,8 @@ impl GroveDb {
             if element_mmr_size == 0 {
                 return parent.bind(query, &[0u8; 32]);
             }
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "MMR proof contains no leaves but element mmr_size is {} (expected 0)",
                     element_mmr_size
@@ -2808,7 +2817,7 @@ impl GroveDb {
         // (combine_hash(value_hash || mmr_root)) before reporting any leaf.
         let (mmr_root, verified_leaves) = mmr_proof
             .verify_and_get_root()
-            .map_err(|e| Error::InvalidProof(query.clone(), format!("{}", e)))?;
+            .map_err(|e| invalid_proof(query, format!("{}", e)))?;
         parent.bind(query, &mmr_root)?;
 
         // Root only: the parent element is bound and this layer's leaves
@@ -2819,13 +2828,15 @@ impl GroveDb {
         }
 
         // Get the sub-query items for this path to enforce succinctness.
-        let sub_query =
-            query
-                .query_items_at_path(path, grove_version)?
-                .ok_or(Error::InvalidProof(
-                    query.clone(),
+        let sub_query = match query.query_items_at_path(path, grove_version)? {
+            Some(sub_query) => sub_query,
+            None => {
+                return Err(invalid_proof(
+                    query,
                     "MMR path not found in query".to_string(),
-                ))?;
+                ))
+            }
+        };
 
         // Completeness + soundness over position INTERVALS, never an
         // enumerated set. `element_mmr_size` is read from the parent
@@ -2842,8 +2853,8 @@ impl GroveDb {
         // Soundness: no unrequested leaves in the proof.
         let extra = expected_indices.extra_in(proved_indices.iter());
         if !extra.is_empty() {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "MMR proof contains unrequested leaf indices ({})",
                     extra.describe()
@@ -2854,8 +2865,8 @@ impl GroveDb {
         // Completeness: every requested leaf must be in the proof.
         let missing = expected_indices.missing_from(&proved_indices);
         if !missing.is_empty() {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "MMR proof missing requested leaf indices ({})",
                     missing.describe()
@@ -2951,8 +2962,8 @@ impl GroveDb {
             Element::BulkAppendTree(total_count, height, _) => (*total_count, *height),
             Element::CommitmentTree(total_count, height, _) => (*total_count, *height),
             _ => {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     "BulkAppendTree proof attached to incompatible element".to_string(),
                 ));
             }
@@ -2964,7 +2975,7 @@ impl GroveDb {
 
         let (bulk_state_root, proof_result) = bulk_proof
             .verify_and_compute_root(element_height, element_total_count)
-            .map_err(|e| Error::InvalidProof(query.clone(), format!("{}", e)))?;
+            .map_err(|e| invalid_proof(query, format!("{}", e)))?;
 
         // An empty `BulkAppendTree` element chains through NULL_HASH, not the
         // domain-tagged empty state root: insert commits the element with a
@@ -3014,13 +3025,15 @@ impl GroveDb {
         T: TryFromVersioned<ProvedPathKeyOptionalValue>,
         Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
     {
-        let sub_query =
-            query
-                .query_items_at_path(path, grove_version)?
-                .ok_or(Error::InvalidProof(
-                    query.clone(),
+        let sub_query = match query.query_items_at_path(path, grove_version)? {
+            Some(sub_query) => sub_query,
+            None => {
+                return Err(invalid_proof(
+                    query,
                     "BulkAppendTree path not found in query".to_string(),
-                ))?;
+                ))
+            }
+        };
 
         // The positions the query selects, as intervals clipped to
         // `total_count` — never enumerated (issue #856).
@@ -3032,11 +3045,11 @@ impl GroveDb {
         // is decoded: O(intervals + proved chunks + buffer entries).
         let proved_spans = proof_result
             .proved_position_spans()
-            .map_err(|e| Error::InvalidProof(query.clone(), format!("{}", e)))?;
+            .map_err(|e| invalid_proof(query, format!("{}", e)))?;
         let missing = expected_positions.missing_from_spans(&proved_spans);
         if !missing.is_empty() {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 format!(
                     "BulkAppendTree proof missing requested positions ({})",
                     missing.describe()
@@ -3056,7 +3069,7 @@ impl GroveDb {
                 sub_query.left_to_right,
                 limit_left.map(|limit| usize::from(limit.max(1))),
             )
-            .map_err(|e| Error::InvalidProof(query.clone(), format!("{}", e)))?;
+            .map_err(|e| invalid_proof(query, format!("{}", e)))?;
 
         for (position, value) in values {
             let key = position.to_be_bytes().to_vec();
@@ -3109,8 +3122,8 @@ impl GroveDb {
         Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
     {
         if ct_bytes.len() < 32 {
-            return Err(Error::InvalidProof(
-                query.clone(),
+            return Err(invalid_proof(
+                query,
                 "CommitmentTree proof too short (missing sinsemilla_root)".to_string(),
             ));
         }
@@ -3171,8 +3184,8 @@ impl GroveDb {
         let (element_count, element_height) = match element {
             Element::DenseAppendOnlyFixedSizeTree(count, height, _) => (*count, *height),
             _ => {
-                return Err(Error::InvalidProof(
-                    query.clone(),
+                return Err(invalid_proof(
+                    query,
                     "DenseTree proof attached to non-DenseTree element".to_string(),
                 ));
             }
@@ -3188,19 +3201,21 @@ impl GroveDb {
         if !report_contents {
             let (computed_root, _entries): ([u8; 32], Vec<(u16, Vec<u8>)>) = dense_proof
                 .verify_and_get_root(element_height, element_count)
-                .map_err(|e| Error::InvalidProof(query.clone(), format!("{}", e)))?;
+                .map_err(|e| invalid_proof(query, format!("{}", e)))?;
             return parent.bind(query, &computed_root);
         }
 
         // Get the sub-query items for this path to build a query for
         // verify_for_query, which enforces both completeness and soundness.
-        let sub_query =
-            query
-                .query_items_at_path(path, grove_version)?
-                .ok_or(Error::InvalidProof(
-                    query.clone(),
+        let sub_query = match query.query_items_at_path(path, grove_version)? {
+            Some(sub_query) => sub_query,
+            None => {
+                return Err(invalid_proof(
+                    query,
                     "DenseTree path not found in query".to_string(),
-                ))?;
+                ))
+            }
+        };
         let level_query = Query {
             items: sub_query.items.to_vec(),
             left_to_right: sub_query.left_to_right,
@@ -3214,7 +3229,7 @@ impl GroveDb {
         // value, and duplicate or out-of-range positions are refused.
         let (computed_root, verified_entries): ([u8; 32], Vec<(u16, Vec<u8>)>) = dense_proof
             .verify_for_query(&level_query, element_height, element_count)
-            .map_err(|e| Error::InvalidProof(query.clone(), format!("{}", e)))?;
+            .map_err(|e| invalid_proof(query, format!("{}", e)))?;
         parent.bind(query, &computed_root)?;
 
         // Add each verified entry to the result set
