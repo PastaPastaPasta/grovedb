@@ -4,16 +4,14 @@ use std::io::{Read, Write};
 
 use ed::{Decode, Encode, Error as EdError, Terminated};
 
-use super::{Node, Op};
+use super::{
+    decode_core::{decode_op, OpDecodeError, MAX_VALUE_LEN},
+    Node, Op,
+};
 use crate::{
     error::Error,
     proofs::{TreeFeatureType, HASH_LENGTH},
 };
-
-/// Maximum allowed value length for large value variants (64MB).
-/// This prevents DoS attacks via malicious proofs specifying unreasonably large
-/// allocations.
-const MAX_VALUE_LEN: u32 = 64 * 1024 * 1024;
 
 fn invalid_key_length_error() -> EdError {
     EdError::IOError(std::io::Error::new(
@@ -1976,15 +1974,48 @@ impl Op {
     }
 
     /// Decode an Op from bytes
+    ///
+    /// Thin wrapper over [`decode_op`] that renders its error as the same
+    /// `InvalidProofError` message the `ed::Decode` based decoder produced.
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
-        Decode::decode(bytes).map_err(|e| match e {
-            EdError::UnexpectedByte(byte) => Error::InvalidProofError(format!(
+        let result = match decode_op(bytes) {
+            Ok(op) => Ok(op),
+            Err(OpDecodeError::UnexpectedByte(byte)) => Err(Error::InvalidProofError(format!(
                 "failed to decode an proofs::Op structure (UnexpectedByte: {byte})"
+            ))),
+            Err(OpDecodeError::UnexpectedEof) => Err(Error::InvalidProofError(
+                "failed to decode an proofs::Op structure (failed to fill whole buffer)"
+                    .to_string(),
             )),
-            EdError::IOError(error) => Error::InvalidProofError(format!(
-                "failed to decode an proofs::Op structure ({error})"
+            Err(OpDecodeError::TruncatedVarint) => Err(Error::InvalidProofError(
+                "failed to decode an proofs::Op structure (Reached EOF)".to_string(),
             )),
-        })
+            Err(OpDecodeError::UnterminatedVarint) => Err(Error::InvalidProofError(
+                "failed to decode an proofs::Op structure (Unterminated varint)".to_string(),
+            )),
+        };
+        // In test builds, cross-check every decode against the original
+        // `ed::Decode` implementation (value, accept/reject, error string).
+        #[cfg(test)]
+        {
+            let mut slice = bytes;
+            match (<Self as Decode>::decode(&mut slice), &result) {
+                (Ok(old), Ok(new)) => assert_eq!(&old, new),
+                (Err(old), Err(Error::InvalidProofError(new))) => {
+                    let expected = match old {
+                        EdError::UnexpectedByte(byte) => format!(
+                            "failed to decode an proofs::Op structure (UnexpectedByte: {byte})"
+                        ),
+                        EdError::IOError(error) => {
+                            format!("failed to decode an proofs::Op structure ({error})")
+                        }
+                    };
+                    assert_eq!(&expected, new);
+                }
+                (old, new) => panic!("decode mismatch: old={old:?} new={new:?}"),
+            }
+        }
+        result
     }
 }
 

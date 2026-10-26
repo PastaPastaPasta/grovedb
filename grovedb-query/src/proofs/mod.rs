@@ -3,10 +3,12 @@
 //! These types define the proof operators and node variants used to construct
 //! and verify Merkle proofs in GroveDB/Merk.
 
+pub mod decode_core;
 mod encoding;
 
 mod tree_feature_type;
 
+pub use decode_core::{decode_op, OpDecodeError};
 pub use encoding::{encode_into, Decoder};
 pub use tree_feature_type::{NodeType, TreeFeatureType};
 

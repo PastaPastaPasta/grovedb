@@ -53,7 +53,11 @@ impl Iterator for Decoder<'_> {
     type Item = Result<Op, crate::error::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|result| result.map_err(Into::into))
+        match self.inner.next() {
+            None => None,
+            Some(Ok(op)) => Some(Ok(op)),
+            Some(Err(error)) => Some(Err(error.into())),
+        }
     }
 }
 
