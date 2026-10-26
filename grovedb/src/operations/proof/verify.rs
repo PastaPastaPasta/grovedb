@@ -150,6 +150,18 @@ fn corrupted_layer_path(context: &str, path: &[&[u8]], query: &PathQuery) -> Err
     ))
 }
 
+/// Owned copy of a borrowed path, component by component, in order. An index
+/// loop rather than `iter().map(..).collect()`.
+fn path_to_owned(path: &[&[u8]]) -> Vec<Vec<u8>> {
+    let mut owned = Vec::with_capacity(path.len());
+    let mut i = 0;
+    while i < path.len() {
+        owned.push(path[i].to_vec());
+        i += 1;
+    }
+    owned
+}
+
 impl GroveDb {
     /// Verifies a proof against a path query with the given options, returning
     /// the root hash and deserialized results.
@@ -1980,11 +1992,8 @@ impl GroveDb {
                                     // key made `(path, key)` lookups miss —
                                     // absence-proof verification would report
                                     // an EXISTING indexed tree as absent.
-                                    let parent_path: Vec<Vec<u8>> = path
-                                        [..path.len().saturating_sub(1)]
-                                        .iter()
-                                        .map(|p| p.to_vec())
-                                        .collect();
+                                    let parent_path: Vec<Vec<u8>> =
+                                        path_to_owned(&path[..path.len().saturating_sub(1)]);
                                     let path_key_optional_value =
                                         ProvedPathKeyOptionalValue::from_proved_key_value(
                                             parent_path,
@@ -2005,7 +2014,7 @@ impl GroveDb {
                                     )? {
                                         let path_key_optional_value =
                                             ProvedPathKeyOptionalValue::from_proved_key_value(
-                                                path.iter().map(|p| p.to_vec()).collect(),
+                                                path_to_owned(&path),
                                                 proved_key_value.clone(),
                                             );
                                         result.push(
@@ -2181,7 +2190,7 @@ impl GroveDb {
                                     {
                                         let path_key_optional_value =
                                             ProvedPathKeyOptionalValue::from_proved_key_value(
-                                                path.iter().map(|p| p.to_vec()).collect(),
+                                                path_to_owned(&path),
                                                 proved_key_value.clone(),
                                             );
                                         result.push(
@@ -2425,8 +2434,7 @@ impl GroveDb {
                                         // the no-lower-layer terminal arm —
                                         // including the key would make
                                         // `(path, key)` lookups miss.
-                                        let parent_path: Vec<Vec<u8>> =
-                                            current_path.iter().map(|p| p.to_vec()).collect();
+                                        let parent_path: Vec<Vec<u8>> = path_to_owned(current_path);
                                         let path_key_optional_value =
                                             ProvedPathKeyOptionalValue::from_proved_key_value(
                                                 parent_path,
@@ -2539,7 +2547,7 @@ impl GroveDb {
 
                         let path_key_optional_value =
                             ProvedPathKeyOptionalValue::from_proved_key_value(
-                                path.iter().map(|p| p.to_vec()).collect(),
+                                path_to_owned(&path),
                                 proved_key_value,
                             );
                         result.push(path_key_optional_value.try_into_versioned(grove_version)?);
@@ -2576,7 +2584,7 @@ impl GroveDb {
                         if query.should_add_parent_tree_at_path(current_path, grove_version)? {
                             let path_key_optional_value =
                                 ProvedPathKeyOptionalValue::from_proved_key_value(
-                                    path.iter().map(|p| p.to_vec()).collect(),
+                                    path_to_owned(&path),
                                     proved_key_value.clone(),
                                 );
                             result.push(path_key_optional_value.try_into_versioned(grove_version)?);

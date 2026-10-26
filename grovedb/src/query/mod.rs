@@ -1222,11 +1222,7 @@ impl PathQuery {
                     if query_item.contains(key) {
                         if let Some(subquery_path) = &subquery_branch.subquery_path {
                             if path_after_top_removed.len() <= subquery_path.len() {
-                                if path_after_top_removed
-                                    .iter()
-                                    .zip(subquery_path)
-                                    .all(|(a, b)| *a == b.as_slice())
-                                {
+                                if common_prefix_eq(path_after_top_removed, subquery_path) {
                                     return if path_after_top_removed.len() == subquery_path.len() {
                                         subquery_branch.subquery.as_ref().is_some_and(|subquery| {
                                             subquery.add_parent_tree_on_subquery
@@ -1235,11 +1231,7 @@ impl PathQuery {
                                         false
                                     };
                                 }
-                            } else if path_after_top_removed
-                                .iter()
-                                .take(subquery_path.len())
-                                .zip(subquery_path)
-                                .all(|(a, b)| *a == b.as_slice())
+                            } else if common_prefix_eq(path_after_top_removed, subquery_path)
                                 && let Some(subquery) = &subquery_branch.subquery
                             {
                                 return recursive_should_add_parent_tree_at_path(
@@ -1261,11 +1253,7 @@ impl PathQuery {
 
             if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
                 if path_after_top_removed.len() <= subquery_path.len() {
-                    if path_after_top_removed
-                        .iter()
-                        .zip(subquery_path)
-                        .all(|(a, b)| *a == b.as_slice())
-                    {
+                    if common_prefix_eq(path_after_top_removed, subquery_path) {
                         return if path_after_top_removed.len() == subquery_path.len() {
                             query
                                 .default_subquery_branch
@@ -1276,11 +1264,7 @@ impl PathQuery {
                             false
                         };
                     }
-                } else if path_after_top_removed
-                    .iter()
-                    .take(subquery_path.len())
-                    .zip(subquery_path)
-                    .all(|(a, b)| *a == b.as_slice())
+                } else if common_prefix_eq(path_after_top_removed, subquery_path)
                     && let Some(subquery) = &query.default_subquery_branch.subquery
                 {
                     return recursive_should_add_parent_tree_at_path(
@@ -1301,14 +1285,14 @@ impl PathQuery {
         Ok(match given_path_len.cmp(&self_path_len) {
             Ordering::Less => false,
             Ordering::Equal => {
-                if path.iter().zip(&self.path).all(|(a, b)| *a == b.as_slice()) {
+                if common_prefix_eq(path, &self.path) {
                     self.query.query.add_parent_tree_on_subquery
                 } else {
                     false
                 }
             }
             Ordering::Greater => {
-                if !self.path.iter().zip(path).all(|(a, b)| a.as_slice() == *b) {
+                if !common_prefix_eq(path, &self.path) {
                     return Ok(false);
                 }
                 recursive_should_add_parent_tree_at_path(&self.query.query, &path[self_path_len..])
@@ -1391,12 +1375,7 @@ impl PathQuery {
                         // Mid-subquery_path: no query node here.
                         return None;
                     }
-                    if !rest
-                        .iter()
-                        .take(subquery_path.len())
-                        .zip(subquery_path)
-                        .all(|(a, b)| *a == b.as_slice())
-                    {
+                    if !common_prefix_eq(rest, subquery_path) {
                         return None;
                     }
                     let after = &rest[subquery_path.len()..];
@@ -1417,7 +1396,7 @@ impl PathQuery {
             // Above the query root: nothing can carry a read mode.
             return None;
         }
-        if !self.path.iter().zip(path).all(|(a, b)| a.as_slice() == *b) {
+        if !common_prefix_eq(path, &self.path) {
             return None;
         }
         let node = resolve_node_at_path(&self.query.query, &path[self_path_len..])?;
@@ -1453,11 +1432,7 @@ impl PathQuery {
                     if query_item.contains(key) {
                         if let Some(subquery_path) = &subquery_branch.subquery_path {
                             if path_after_top_removed.len() <= subquery_path.len() {
-                                if path_after_top_removed
-                                    .iter()
-                                    .zip(subquery_path)
-                                    .all(|(a, b)| *a == b.as_slice())
-                                {
+                                if common_prefix_eq(path_after_top_removed, subquery_path) {
                                     return if path_after_top_removed.len() == subquery_path.len() {
                                         subquery_branch.subquery.as_ref().map(|subquery| {
                                             SinglePathSubquery::from_query(subquery)
@@ -1472,11 +1447,7 @@ impl PathQuery {
                                         ))
                                     };
                                 }
-                            } else if path_after_top_removed
-                                .iter()
-                                .take(subquery_path.len())
-                                .zip(subquery_path)
-                                .all(|(a, b)| *a == b.as_slice())
+                            } else if common_prefix_eq(path_after_top_removed, subquery_path)
                                 && let Some(subquery) = &subquery_branch.subquery
                             {
                                 return recursive_query_items(
@@ -1495,11 +1466,7 @@ impl PathQuery {
 
             if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
                 if path_after_top_removed.len() <= subquery_path.len() {
-                    if path_after_top_removed
-                        .iter()
-                        .zip(subquery_path)
-                        .all(|(a, b)| *a == b.as_slice())
-                    {
+                    if common_prefix_eq(path_after_top_removed, subquery_path) {
                         // The paths are equal for example if we had a sub path of
                         // path : 1 / 2
                         // subquery : All items
@@ -1522,11 +1489,7 @@ impl PathQuery {
                             ))
                         };
                     }
-                } else if path_after_top_removed
-                    .iter()
-                    .take(subquery_path.len())
-                    .zip(subquery_path)
-                    .all(|(a, b)| *a == b.as_slice())
+                } else if common_prefix_eq(path_after_top_removed, subquery_path)
                     && let Some(subquery) = &query.default_subquery_branch.subquery
                 {
                     return recursive_query_items(
@@ -1546,7 +1509,7 @@ impl PathQuery {
 
         Ok(match given_path_len.cmp(&self_path_len) {
             Ordering::Less => {
-                if path.iter().zip(&self.path).all(|(a, b)| *a == b.as_slice()) {
+                if common_prefix_eq(path, &self.path) {
                     Some(SinglePathSubquery::from_key_when_in_path(
                         &self.path[given_path_len],
                         false,
@@ -1557,14 +1520,14 @@ impl PathQuery {
                 }
             }
             Ordering::Equal => {
-                if path.iter().zip(&self.path).all(|(a, b)| *a == b.as_slice()) {
+                if common_prefix_eq(path, &self.path) {
                     Some(SinglePathSubquery::from_path_query(self))
                 } else {
                     None
                 }
             }
             Ordering::Greater => {
-                if !self.path.iter().zip(path).all(|(a, b)| a.as_slice() == *b) {
+                if !common_prefix_eq(path, &self.path) {
                     return Ok(None);
                 }
                 recursive_query_items(&self.query.query, &path[self_path_len..])
@@ -1607,6 +1570,21 @@ impl HasSubquery<'_> {
             HasSubquery::Always => true,
         }
     }
+}
+
+/// Whether `a` and `b` agree on their common prefix: `a[i] == b[i]` for
+/// every `i < min(a.len(), b.len())`. The same predicate as
+/// `a.iter().zip(b).all(..)`, as an index loop.
+fn common_prefix_eq(a: &[&[u8]], b: &[Vec<u8>]) -> bool {
+    let n = if a.len() < b.len() { a.len() } else { b.len() };
+    let mut i = 0;
+    while i < n {
+        if a[i] != b[i].as_slice() {
+            return false;
+        }
+        i += 1;
+    }
+    true
 }
 
 /// The whole-query serving gate for per-instance limits
@@ -1838,6 +1816,42 @@ mod tests {
         tests::{common::compare_result_tuples, make_deep_tree, TEST_LEAF},
         Element, Error, GroveDb, PathQuery, SizedQuery,
     };
+
+    /// `common_prefix_eq` against the `zip().all()` forms it replaced
+    /// (with and without `take(b.len())`, both operand orders), over every
+    /// pair of paths of length <= 3 drawn from a two-letter alphabet,
+    /// including empty components.
+    #[test]
+    fn common_prefix_eq_matches_zip_all() {
+        let components: [&[u8]; 3] = [b"", b"a", b"b"];
+        let mut paths: Vec<Vec<&[u8]>> = vec![vec![]];
+        for len in 1..=3 {
+            let mut next = Vec::new();
+            for p in paths.iter().filter(|p| p.len() == len - 1) {
+                for c in components {
+                    let mut q = p.clone();
+                    q.push(c);
+                    next.push(q);
+                }
+            }
+            paths.extend(next);
+        }
+        for a in &paths {
+            for b_borrowed in &paths {
+                let b: Vec<Vec<u8>> = b_borrowed.iter().map(|c| c.to_vec()).collect();
+                let zip_all = a.iter().zip(&b).all(|(x, y)| *x == y.as_slice());
+                let take_zip_all = a
+                    .iter()
+                    .take(b.len())
+                    .zip(&b)
+                    .all(|(x, y)| *x == y.as_slice());
+                let swapped = b.iter().zip(a).all(|(y, x)| y.as_slice() == *x);
+                assert_eq!(zip_all, take_zip_all);
+                assert_eq!(zip_all, swapped);
+                assert_eq!(super::common_prefix_eq(a, &b), zip_all, "{a:?} vs {b:?}");
+            }
+        }
+    }
 
     #[test]
     fn test_same_path_different_query_merge() {
