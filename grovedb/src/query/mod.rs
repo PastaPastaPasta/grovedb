@@ -1217,55 +1217,48 @@ impl PathQuery {
             let key = path[0];
             let path_after_top_removed = &path[1..];
 
-            if let Some(conditional_branches) = &query.conditional_subquery_branches {
-                let mut i = 0;
-                while i < conditional_branches.len() {
-                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
-                    else {
-                        break;
-                    };
-                    if query_item.contains(key) {
-                        if let Some(subquery_path) = &subquery_branch.subquery_path {
-                            if path_after_top_removed.len() <= subquery_path.len() {
-                                if common_prefix_eq(path_after_top_removed, subquery_path) {
-                                    return if path_after_top_removed.len() == subquery_path.len() {
-                                        subquery_branch.subquery.as_ref().is_some_and(|subquery| {
-                                            subquery.add_parent_tree_on_subquery
-                                        })
-                                    } else {
-                                        false
-                                    };
+            if let Some(conditional_branches) = &query.conditional_subquery_branches
+                && let Some(index) = first_branch_containing(conditional_branches, key)
+                && let Some((_, subquery_branch)) = conditional_branches.get_index(index)
+            {
+                if let Some(subquery_path) = &subquery_branch.subquery_path {
+                    if path_after_top_removed.len() <= subquery_path.len() {
+                        if common_prefix_eq(path_after_top_removed, subquery_path) {
+                            return if path_after_top_removed.len() == subquery_path.len() {
+                                match &subquery_branch.subquery {
+                                    Some(subquery) => subquery.add_parent_tree_on_subquery,
+                                    None => false,
                                 }
-                            } else if common_prefix_eq(path_after_top_removed, subquery_path)
-                                && let Some(subquery) = &subquery_branch.subquery
-                            {
-                                return recursive_should_add_parent_tree_at_path(
-                                    subquery,
-                                    &path_after_top_removed[subquery_path.len()..],
-                                );
-                            }
-                        } else if let Some(subquery) = &subquery_branch.subquery {
-                            return recursive_should_add_parent_tree_at_path(
-                                subquery,
-                                path_after_top_removed,
-                            );
+                            } else {
+                                false
+                            };
                         }
-
-                        return false;
+                    } else if common_prefix_eq(path_after_top_removed, subquery_path)
+                        && let Some(subquery) = &subquery_branch.subquery
+                    {
+                        return recursive_should_add_parent_tree_at_path(
+                            subquery,
+                            &path_after_top_removed[subquery_path.len()..],
+                        );
                     }
-                    i += 1;
+                } else if let Some(subquery) = &subquery_branch.subquery {
+                    return recursive_should_add_parent_tree_at_path(
+                        subquery,
+                        path_after_top_removed,
+                    );
                 }
+
+                return false;
             }
 
             if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
                 if path_after_top_removed.len() <= subquery_path.len() {
                     if common_prefix_eq(path_after_top_removed, subquery_path) {
                         return if path_after_top_removed.len() == subquery_path.len() {
-                            query
-                                .default_subquery_branch
-                                .subquery
-                                .as_ref()
-                                .is_some_and(|subquery| subquery.add_parent_tree_on_subquery)
+                            match &query.default_subquery_branch.subquery {
+                                Some(subquery) => subquery.add_parent_tree_on_subquery,
+                                None => false,
+                            }
                         } else {
                             false
                         };
@@ -1361,18 +1354,11 @@ impl PathQuery {
             let key = path[0];
             let rest = &path[1..];
 
-            if let Some(conditional_branches) = &query.conditional_subquery_branches {
-                let mut i = 0;
-                while i < conditional_branches.len() {
-                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
-                    else {
-                        break;
-                    };
-                    if query_item.contains(key) {
-                        return resolve_branch_at_path(subquery_branch, rest);
-                    }
-                    i += 1;
-                }
+            if let Some(conditional_branches) = &query.conditional_subquery_branches
+                && let Some(index) = first_branch_containing(conditional_branches, key)
+                && let Some((_, subquery_branch)) = conditional_branches.get_index(index)
+            {
+                return resolve_branch_at_path(subquery_branch, rest);
             }
             resolve_branch_at_path(&query.default_subquery_branch, rest)
         }
@@ -1391,15 +1377,15 @@ impl PathQuery {
                         return None;
                     }
                     let after = &rest[subquery_path.len()..];
-                    branch
-                        .subquery
-                        .as_deref()
-                        .and_then(|subquery| resolve_node_at_path(subquery, after))
+                    match &branch.subquery {
+                        Some(subquery) => resolve_node_at_path(subquery, after),
+                        None => None,
+                    }
                 }
-                None => branch
-                    .subquery
-                    .as_deref()
-                    .and_then(|subquery| resolve_node_at_path(subquery, rest)),
+                None => match &branch.subquery {
+                    Some(subquery) => resolve_node_at_path(subquery, rest),
+                    None => None,
+                },
             }
         }
 
@@ -1428,6 +1414,9 @@ impl PathQuery {
                 .path_query_methods
                 .query_items_at_path
         );
+        // `match` rather than `Option::map`, to keep closures off the
+        // verifier path.
+        #[allow(clippy::manual_map)]
         fn recursive_query_items<'b>(
             query: &'b Query,
             path: &[&[u8]],
@@ -1439,47 +1428,43 @@ impl PathQuery {
             let key = path[0];
             let path_after_top_removed = &path[1..];
 
-            if let Some(conditional_branches) = &query.conditional_subquery_branches {
-                let mut i = 0;
-                while i < conditional_branches.len() {
-                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
-                    else {
-                        break;
-                    };
-                    if query_item.contains(key) {
-                        if let Some(subquery_path) = &subquery_branch.subquery_path {
-                            if path_after_top_removed.len() <= subquery_path.len() {
-                                if common_prefix_eq(path_after_top_removed, subquery_path) {
-                                    return if path_after_top_removed.len() == subquery_path.len() {
-                                        subquery_branch.subquery.as_ref().map(|subquery| {
-                                            SinglePathSubquery::from_query(subquery)
-                                        })
-                                    } else {
-                                        let last_path_item = path.len() == subquery_path.len();
-                                        let has_subquery = subquery_branch.subquery.is_some();
-                                        Some(SinglePathSubquery::from_key_when_in_path(
-                                            &subquery_path[path_after_top_removed.len()],
-                                            last_path_item,
-                                            has_subquery,
-                                        ))
-                                    };
+            if let Some(conditional_branches) = &query.conditional_subquery_branches
+                && let Some(index) = first_branch_containing(conditional_branches, key)
+                && let Some((_, subquery_branch)) = conditional_branches.get_index(index)
+            {
+                if let Some(subquery_path) = &subquery_branch.subquery_path {
+                    if path_after_top_removed.len() <= subquery_path.len() {
+                        if common_prefix_eq(path_after_top_removed, subquery_path) {
+                            return if path_after_top_removed.len() == subquery_path.len() {
+                                match &subquery_branch.subquery {
+                                    Some(subquery) => {
+                                        Some(SinglePathSubquery::from_query(subquery))
+                                    }
+                                    None => None,
                                 }
-                            } else if common_prefix_eq(path_after_top_removed, subquery_path)
-                                && let Some(subquery) = &subquery_branch.subquery
-                            {
-                                return recursive_query_items(
-                                    subquery,
-                                    &path_after_top_removed[subquery_path.len()..],
-                                );
-                            }
-                        } else if let Some(subquery) = &subquery_branch.subquery {
-                            return recursive_query_items(subquery, path_after_top_removed);
+                            } else {
+                                let last_path_item = path.len() == subquery_path.len();
+                                let has_subquery = subquery_branch.subquery.is_some();
+                                Some(SinglePathSubquery::from_key_when_in_path(
+                                    &subquery_path[path_after_top_removed.len()],
+                                    last_path_item,
+                                    has_subquery,
+                                ))
+                            };
                         }
-
-                        return None;
+                    } else if common_prefix_eq(path_after_top_removed, subquery_path)
+                        && let Some(subquery) = &subquery_branch.subquery
+                    {
+                        return recursive_query_items(
+                            subquery,
+                            &path_after_top_removed[subquery_path.len()..],
+                        );
                     }
-                    i += 1;
+                } else if let Some(subquery) = &subquery_branch.subquery {
+                    return recursive_query_items(subquery, path_after_top_removed);
                 }
+
+                return None;
             }
 
             if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
@@ -1492,11 +1477,10 @@ impl PathQuery {
                         // If we are asking what is the subquery when we are at 1 / 2
                         // we should get
                         return if path_after_top_removed.len() == subquery_path.len() {
-                            query
-                                .default_subquery_branch
-                                .subquery
-                                .as_ref()
-                                .map(|subquery| SinglePathSubquery::from_query(subquery))
+                            match &query.default_subquery_branch.subquery {
+                                Some(subquery) => Some(SinglePathSubquery::from_query(subquery)),
+                                None => None,
+                            }
                         } else {
                             let last_path_item = path.len() == subquery_path.len();
                             let has_subquery = query.default_subquery_branch.subquery.is_some();
@@ -1583,17 +1567,7 @@ impl HasSubquery<'_> {
         match self {
             HasSubquery::NoSubquery => false,
             HasSubquery::Conditionally(conditionally) => {
-                let mut i = 0;
-                while i < conditionally.len() {
-                    let Some((query_item, _)) = conditionally.get_index(i) else {
-                        break;
-                    };
-                    if query_item.contains(key) {
-                        return true;
-                    }
-                    i += 1;
-                }
-                false
+                first_branch_containing(conditionally, key).is_some()
             }
             HasSubquery::Always => true,
         }
@@ -1604,15 +1578,67 @@ impl HasSubquery<'_> {
 /// every `i < min(a.len(), b.len())`. The same predicate as
 /// `a.iter().zip(b).all(..)`, as an index loop.
 fn common_prefix_eq(a: &[&[u8]], b: &[Vec<u8>]) -> bool {
-    let n = if a.len() < b.len() { a.len() } else { b.len() };
+    common_prefix_eq_from(a, b, 0)
+}
+
+/// `a[j] == b[j]` for every `j` in `i..min(a.len(), b.len())`, compared in
+/// increasing `j` and stopping at the first mismatch. Recursive rather than a
+/// loop; the depth is at most `b.len() - i`, and `b` is always a path taken
+/// from the query itself (`PathQuery::path` or a `subquery_path`).
+fn common_prefix_eq_from(a: &[&[u8]], b: &[Vec<u8>], i: usize) -> bool {
+    if i < a.len() {
+        if i < b.len() {
+            if a[i] != b[i].as_slice() {
+                false
+            } else {
+                common_prefix_eq_from(a, b, i + 1)
+            }
+        } else {
+            true
+        }
+    } else {
+        true
+    }
+}
+
+/// `in_path` of a level `SinglePathSubquery::from_key_when_in_path`
+/// synthesizes for `key`.
+fn synthesized_in_path(
+    key: &Vec<u8>,
+    subquery_is_last_path_item: bool,
+    subquery_has_inner_subquery: bool,
+) -> Option<Cow<'_, Key>> {
+    // in this case there should be no in_path, because we are trying to get this
+    // level of items and nothing underneath
+    if subquery_is_last_path_item && !subquery_has_inner_subquery {
+        None
+    } else {
+        Some(Borrowed(key))
+    }
+}
+
+/// Index of the first conditional subquery branch whose item contains
+/// `key`, in `IndexMap` order: the branch the path resolvers take, and the
+/// one `has_subquery_on_key` looks for. `None` if no item contains `key`.
+/// The loop only returns (it has no `break`), so the callers act on the
+/// branch outside any loop. `let ... else` rather than `?`, to keep the
+/// `Try` desugaring off the verifier path.
+#[allow(clippy::question_mark)]
+fn first_branch_containing(
+    branches: &IndexMap<QueryItem, SubqueryBranch>,
+    key: &[u8],
+) -> Option<usize> {
     let mut i = 0;
-    while i < n {
-        if a[i] != b[i].as_slice() {
-            return false;
+    while i < branches.len() {
+        let Some((query_item, _)) = branches.get_index(i) else {
+            return None;
+        };
+        if query_item.contains(key) {
+            return Some(i);
         }
         i += 1;
     }
-    true
+    None
 }
 
 /// The whole-query serving gate for per-instance limits
@@ -1777,13 +1803,8 @@ impl<'a> SinglePathSubquery<'a> {
         subquery_is_last_path_item: bool,
         subquery_has_inner_subquery: bool,
     ) -> SinglePathSubquery<'a> {
-        // in this case there should be no in_path, because we are trying to get this
-        // level of items and nothing underneath
-        let in_path = if subquery_is_last_path_item && !subquery_has_inner_subquery {
-            None
-        } else {
-            Some(Borrowed(key))
-        };
+        let in_path =
+            synthesized_in_path(key, subquery_is_last_path_item, subquery_has_inner_subquery);
         SinglePathSubquery {
             items: Cow::Owned(vec![QueryItem::Key(key.clone())]),
             has_subquery: HasSubquery::NoSubquery,
@@ -4001,5 +4022,549 @@ mod tests {
             super::query_validation_error_to_static_str(other),
             "AggregateCountOnRange query validation failed"
         );
+    }
+}
+
+/// The path resolvers, `has_subquery_on_key` and `from_key_when_in_path`
+/// against verbatim copies of their previous bodies (the in-loop `return`s
+/// over the conditional branches, and the `Option` combinators), on
+/// generated query trees with overlapping conditional items, subquery paths,
+/// read modes and every path of length <= 5 over a three-key alphabet.
+#[cfg(feature = "minimal")]
+#[cfg(test)]
+mod resolver_reference_tests {
+    use super::*;
+
+    // ---- previous bodies, verbatim except for the `ref_` names, `pq` for
+    // `self`, and no version gate / `Ok` wrapper ----
+
+    fn ref_should_add_parent_tree_at_path(pq: &PathQuery, path: &[&[u8]]) -> bool {
+        fn recursive_should_add_parent_tree_at_path(query: &Query, path: &[&[u8]]) -> bool {
+            if path.is_empty() {
+                return query.add_parent_tree_on_subquery;
+            }
+
+            let key = path[0];
+            let path_after_top_removed = &path[1..];
+
+            if let Some(conditional_branches) = &query.conditional_subquery_branches {
+                let mut i = 0;
+                while i < conditional_branches.len() {
+                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
+                    else {
+                        break;
+                    };
+                    if query_item.contains(key) {
+                        if let Some(subquery_path) = &subquery_branch.subquery_path {
+                            if path_after_top_removed.len() <= subquery_path.len() {
+                                if ref_common_prefix_eq(path_after_top_removed, subquery_path) {
+                                    return if path_after_top_removed.len() == subquery_path.len() {
+                                        subquery_branch.subquery.as_ref().is_some_and(|subquery| {
+                                            subquery.add_parent_tree_on_subquery
+                                        })
+                                    } else {
+                                        false
+                                    };
+                                }
+                            } else if ref_common_prefix_eq(path_after_top_removed, subquery_path)
+                                && let Some(subquery) = &subquery_branch.subquery
+                            {
+                                return recursive_should_add_parent_tree_at_path(
+                                    subquery,
+                                    &path_after_top_removed[subquery_path.len()..],
+                                );
+                            }
+                        } else if let Some(subquery) = &subquery_branch.subquery {
+                            return recursive_should_add_parent_tree_at_path(
+                                subquery,
+                                path_after_top_removed,
+                            );
+                        }
+
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+
+            if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
+                if path_after_top_removed.len() <= subquery_path.len() {
+                    if ref_common_prefix_eq(path_after_top_removed, subquery_path) {
+                        return if path_after_top_removed.len() == subquery_path.len() {
+                            query
+                                .default_subquery_branch
+                                .subquery
+                                .as_ref()
+                                .is_some_and(|subquery| subquery.add_parent_tree_on_subquery)
+                        } else {
+                            false
+                        };
+                    }
+                } else if ref_common_prefix_eq(path_after_top_removed, subquery_path)
+                    && let Some(subquery) = &query.default_subquery_branch.subquery
+                {
+                    return recursive_should_add_parent_tree_at_path(
+                        subquery,
+                        &path_after_top_removed[subquery_path.len()..],
+                    );
+                }
+            } else if let Some(subquery) = &query.default_subquery_branch.subquery {
+                return recursive_should_add_parent_tree_at_path(subquery, path_after_top_removed);
+            }
+
+            false
+        }
+
+        let self_path_len = pq.path.len();
+        let given_path_len = path.len();
+
+        match given_path_len.cmp(&self_path_len) {
+            Ordering::Less => false,
+            Ordering::Equal => {
+                if ref_common_prefix_eq(path, &pq.path) {
+                    pq.query.query.add_parent_tree_on_subquery
+                } else {
+                    false
+                }
+            }
+            Ordering::Greater => {
+                if !ref_common_prefix_eq(path, &pq.path) {
+                    return false;
+                }
+                recursive_should_add_parent_tree_at_path(&pq.query.query, &path[self_path_len..])
+            }
+        }
+    }
+
+    fn ref_read_mode_at_path<'p>(pq: &'p PathQuery, path: &[&[u8]]) -> Option<&'p ReadMode> {
+        /// Resolve the query NODE at exactly `path` below `query`,
+        /// following conditional and default subquery branches the same
+        /// way `query_items_at_path`'s resolver does — but returning
+        /// the node itself rather than its per-layer view, and `None`
+        /// for mid-`subquery_path` positions.
+        fn resolve_node_at_path<'b>(query: &'b Query, path: &[&[u8]]) -> Option<&'b Query> {
+            if path.is_empty() {
+                return Some(query);
+            }
+            let key = path[0];
+            let rest = &path[1..];
+
+            if let Some(conditional_branches) = &query.conditional_subquery_branches {
+                let mut i = 0;
+                while i < conditional_branches.len() {
+                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
+                    else {
+                        break;
+                    };
+                    if query_item.contains(key) {
+                        return resolve_branch_at_path(subquery_branch, rest);
+                    }
+                    i += 1;
+                }
+            }
+            resolve_branch_at_path(&query.default_subquery_branch, rest)
+        }
+
+        fn resolve_branch_at_path<'b>(
+            branch: &'b SubqueryBranch,
+            rest: &[&[u8]],
+        ) -> Option<&'b Query> {
+            match &branch.subquery_path {
+                Some(subquery_path) => {
+                    if rest.len() < subquery_path.len() {
+                        // Mid-subquery_path: no query node here.
+                        return None;
+                    }
+                    if !ref_common_prefix_eq(rest, subquery_path) {
+                        return None;
+                    }
+                    let after = &rest[subquery_path.len()..];
+                    branch
+                        .subquery
+                        .as_deref()
+                        .and_then(|subquery| resolve_node_at_path(subquery, after))
+                }
+                None => branch
+                    .subquery
+                    .as_deref()
+                    .and_then(|subquery| resolve_node_at_path(subquery, rest)),
+            }
+        }
+
+        let self_path_len = pq.path.len();
+        if path.len() < self_path_len {
+            // Above the query root: nothing can carry a read mode.
+            return None;
+        }
+        if !ref_common_prefix_eq(path, &pq.path) {
+            return None;
+        }
+        let node = resolve_node_at_path(&pq.query.query, &path[self_path_len..])?;
+        node.read_mode.as_deref()
+    }
+
+    fn ref_query_items_at_path<'p>(
+        pq: &'p PathQuery,
+        path: &[&[u8]],
+    ) -> Option<SinglePathSubquery<'p>> {
+        fn recursive_query_items<'b>(
+            query: &'b Query,
+            path: &[&[u8]],
+        ) -> Option<SinglePathSubquery<'b>> {
+            if path.is_empty() {
+                return Some(SinglePathSubquery::from_query(query));
+            }
+
+            let key = path[0];
+            let path_after_top_removed = &path[1..];
+
+            if let Some(conditional_branches) = &query.conditional_subquery_branches {
+                let mut i = 0;
+                while i < conditional_branches.len() {
+                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
+                    else {
+                        break;
+                    };
+                    if query_item.contains(key) {
+                        if let Some(subquery_path) = &subquery_branch.subquery_path {
+                            if path_after_top_removed.len() <= subquery_path.len() {
+                                if ref_common_prefix_eq(path_after_top_removed, subquery_path) {
+                                    return if path_after_top_removed.len() == subquery_path.len() {
+                                        subquery_branch.subquery.as_ref().map(|subquery| {
+                                            SinglePathSubquery::from_query(subquery)
+                                        })
+                                    } else {
+                                        let last_path_item = path.len() == subquery_path.len();
+                                        let has_subquery = subquery_branch.subquery.is_some();
+                                        Some(ref_from_key_when_in_path(
+                                            &subquery_path[path_after_top_removed.len()],
+                                            last_path_item,
+                                            has_subquery,
+                                        ))
+                                    };
+                                }
+                            } else if ref_common_prefix_eq(path_after_top_removed, subquery_path)
+                                && let Some(subquery) = &subquery_branch.subquery
+                            {
+                                return recursive_query_items(
+                                    subquery,
+                                    &path_after_top_removed[subquery_path.len()..],
+                                );
+                            }
+                        } else if let Some(subquery) = &subquery_branch.subquery {
+                            return recursive_query_items(subquery, path_after_top_removed);
+                        }
+
+                        return None;
+                    }
+                    i += 1;
+                }
+            }
+
+            if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
+                if path_after_top_removed.len() <= subquery_path.len() {
+                    if ref_common_prefix_eq(path_after_top_removed, subquery_path) {
+                        // The paths are equal for example if we had a sub path of
+                        // path : 1 / 2
+                        // subquery : All items
+
+                        // If we are asking what is the subquery when we are at 1 / 2
+                        // we should get
+                        return if path_after_top_removed.len() == subquery_path.len() {
+                            query
+                                .default_subquery_branch
+                                .subquery
+                                .as_ref()
+                                .map(|subquery| SinglePathSubquery::from_query(subquery))
+                        } else {
+                            let last_path_item = path.len() == subquery_path.len();
+                            let has_subquery = query.default_subquery_branch.subquery.is_some();
+                            Some(ref_from_key_when_in_path(
+                                &subquery_path[path_after_top_removed.len()],
+                                last_path_item,
+                                has_subquery,
+                            ))
+                        };
+                    }
+                } else if ref_common_prefix_eq(path_after_top_removed, subquery_path)
+                    && let Some(subquery) = &query.default_subquery_branch.subquery
+                {
+                    return recursive_query_items(
+                        subquery,
+                        &path_after_top_removed[subquery_path.len()..],
+                    );
+                }
+            } else if let Some(subquery) = &query.default_subquery_branch.subquery {
+                return recursive_query_items(subquery, path_after_top_removed);
+            }
+
+            None
+        }
+
+        let self_path_len = pq.path.len();
+        let given_path_len = path.len();
+
+        match given_path_len.cmp(&self_path_len) {
+            Ordering::Less => {
+                if ref_common_prefix_eq(path, &pq.path) {
+                    Some(ref_from_key_when_in_path(
+                        &pq.path[given_path_len],
+                        false,
+                        true,
+                    ))
+                } else {
+                    None
+                }
+            }
+            Ordering::Equal => {
+                if ref_common_prefix_eq(path, &pq.path) {
+                    Some(SinglePathSubquery::from_path_query(pq))
+                } else {
+                    None
+                }
+            }
+            Ordering::Greater => {
+                if !ref_common_prefix_eq(path, &pq.path) {
+                    return None;
+                }
+                recursive_query_items(&pq.query.query, &path[self_path_len..])
+            }
+        }
+    }
+
+    fn ref_has_subquery_on_key(has_subquery: &HasSubquery<'_>, key: &[u8]) -> bool {
+        match has_subquery {
+            HasSubquery::NoSubquery => false,
+            HasSubquery::Conditionally(conditionally) => {
+                let mut i = 0;
+                while i < conditionally.len() {
+                    let Some((query_item, _)) = conditionally.get_index(i) else {
+                        break;
+                    };
+                    if query_item.contains(key) {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
+            }
+            HasSubquery::Always => true,
+        }
+    }
+
+    fn ref_common_prefix_eq(a: &[&[u8]], b: &[Vec<u8>]) -> bool {
+        let n = if a.len() < b.len() { a.len() } else { b.len() };
+        let mut i = 0;
+        while i < n {
+            if a[i] != b[i].as_slice() {
+                return false;
+            }
+            i += 1;
+        }
+        true
+    }
+
+    fn ref_from_key_when_in_path<'a>(
+        key: &'a Vec<u8>,
+        subquery_is_last_path_item: bool,
+        subquery_has_inner_subquery: bool,
+    ) -> SinglePathSubquery<'a> {
+        // in this case there should be no in_path, because we are trying to get this
+        // level of items and nothing underneath
+        let in_path = if subquery_is_last_path_item && !subquery_has_inner_subquery {
+            None
+        } else {
+            Some(Borrowed(key))
+        };
+        SinglePathSubquery {
+            items: Cow::Owned(vec![QueryItem::Key(key.clone())]),
+            has_subquery: HasSubquery::NoSubquery,
+            // Placeholder — see `synthesized_path_component`. Nothing
+            // here knows which direction the generating query walked
+            // this level in, and for a one-key level nothing needs to:
+            // the direction is an encoding detail of the proof, which
+            // is where verifiers read it from.
+            left_to_right: true,
+            in_path,
+            synthesized_path_component: true,
+            instance_limit: None,
+        }
+    }
+
+    // ---- generator ----
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            // xorshift64*
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn coin(&mut self) -> bool {
+            self.below(2) == 0
+        }
+    }
+
+    const ALPHABET: [&[u8]; 3] = [b"a", b"b", b"c"];
+
+    fn item(rng: &mut Rng) -> QueryItem {
+        match rng.below(6) {
+            0 => QueryItem::Key(b"a".to_vec()),
+            1 => QueryItem::Key(b"b".to_vec()),
+            2 => QueryItem::Key(b"c".to_vec()),
+            3 => QueryItem::Range(b"a".to_vec()..b"c".to_vec()),
+            4 => QueryItem::RangeInclusive(b"b".to_vec()..=b"c".to_vec()),
+            _ => QueryItem::RangeFull(std::ops::RangeFull),
+        }
+    }
+
+    fn path(rng: &mut Rng, max_len: u64) -> Vec<Vec<u8>> {
+        let len = rng.below(max_len + 1);
+        (0..len)
+            .map(|_| ALPHABET[rng.below(3) as usize].to_vec())
+            .collect()
+    }
+
+    fn branch(rng: &mut Rng, depth: u32, counter: &mut u64) -> SubqueryBranch {
+        SubqueryBranch {
+            subquery_path: if rng.coin() { Some(path(rng, 2)) } else { None },
+            subquery: if depth > 0 && rng.below(3) != 0 {
+                Some(Box::new(query(rng, depth - 1, counter)))
+            } else {
+                None
+            },
+        }
+    }
+
+    fn query(rng: &mut Rng, depth: u32, counter: &mut u64) -> Query {
+        *counter += 1;
+        let mut q = Query::new_with_direction(rng.coin());
+        for _ in 0..rng.below(3) {
+            q.items.push(item(rng));
+        }
+        q.add_parent_tree_on_subquery = rng.coin();
+        q.limit = if rng.coin() {
+            Some(rng.below(4) as u16)
+        } else {
+            None
+        };
+        // A distinct `sum_limit` per node, so a resolved read mode names
+        // its node.
+        if rng.below(3) == 0 {
+            q.read_mode = Some(Box::new(ReadMode::SumBudget(SumBudgetRead {
+                sum_limit: *counter,
+                match_limit: None,
+            })));
+        }
+        q.default_subquery_branch = branch(rng, depth, counter);
+        if rng.coin() {
+            let mut branches = IndexMap::new();
+            for _ in 0..1 + rng.below(3) {
+                branches.insert(item(rng), branch(rng, depth, counter));
+            }
+            q.conditional_subquery_branches = Some(branches);
+        }
+        q
+    }
+
+    fn all_paths(max_len: usize) -> Vec<Vec<&'static [u8]>> {
+        let mut paths: Vec<Vec<&'static [u8]>> = vec![vec![]];
+        let mut frontier = paths.clone();
+        for _ in 0..max_len {
+            let mut next = Vec::new();
+            for p in &frontier {
+                for c in ALPHABET {
+                    let mut q = p.clone();
+                    q.push(c);
+                    next.push(q);
+                }
+            }
+            paths.extend(next.iter().cloned());
+            frontier = next;
+        }
+        paths
+    }
+
+    #[test]
+    fn path_resolvers_match_previous_bodies() {
+        let grove_version = GroveVersion::latest();
+        let paths = all_paths(5);
+        let keys: [&[u8]; 6] = [b"", b"a", b"b", b"bb", b"c", b"d"];
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut counter = 0;
+        let (mut items_some, mut read_modes, mut parents) = (0u64, 0u64, 0u64);
+        for _ in 0..1500 {
+            let depth = rng.below(4) as u32;
+            let pq = PathQuery::new(
+                path(&mut rng, 2),
+                SizedQuery::new(query(&mut rng, depth, &mut counter), None, None),
+            );
+            for p in &paths {
+                let new = pq
+                    .should_add_parent_tree_at_path(p, grove_version)
+                    .expect("served version");
+                assert_eq!(new, ref_should_add_parent_tree_at_path(&pq, p));
+                parents += new as u64;
+
+                let new = pq.read_mode_at_path(p).map(|r| r as *const ReadMode);
+                let old = ref_read_mode_at_path(&pq, p).map(|r| r as *const ReadMode);
+                assert_eq!(new, old, "{p:?} {pq:?}");
+                read_modes += new.is_some() as u64;
+
+                let new = pq
+                    .query_items_at_path(p, grove_version)
+                    .expect("served version");
+                let old = ref_query_items_at_path(&pq, p);
+                assert_eq!(new, old, "{p:?} {pq:?}");
+                if let (Some(new), Some(old)) = (new, old) {
+                    items_some += 1;
+                    for key in keys {
+                        assert_eq!(
+                            new.has_subquery.has_subquery_on_key(key),
+                            ref_has_subquery_on_key(&old.has_subquery, key)
+                        );
+                    }
+                }
+            }
+        }
+        // The generator reaches every kind of answer.
+        assert!(items_some > 10_000, "{items_some}");
+        assert!(read_modes > 1_000, "{read_modes}");
+        assert!(parents > 1_000, "{parents}");
+    }
+
+    #[test]
+    fn first_branch_containing_is_the_first_match() {
+        let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+        let mut counter = 0;
+        let keys: [&[u8]; 6] = [b"", b"a", b"b", b"bb", b"c", b"d"];
+        for _ in 0..5000 {
+            let mut branches = IndexMap::new();
+            for _ in 0..rng.below(5) {
+                branches.insert(item(&mut rng), branch(&mut rng, 0, &mut counter));
+            }
+            for key in keys {
+                let expected = branches.keys().position(|item| item.contains(key));
+                assert_eq!(first_branch_containing(&branches, key), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn from_key_when_in_path_matches_previous_body() {
+        let key = b"k".to_vec();
+        for last in [false, true] {
+            for inner in [false, true] {
+                assert_eq!(
+                    SinglePathSubquery::from_key_when_in_path(&key, last, inner),
+                    ref_from_key_when_in_path(&key, last, inner)
+                );
+            }
+        }
     }
 }
