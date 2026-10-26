@@ -542,14 +542,7 @@ impl Element {
     fn has_pcpsit_with_any_secondary(&self) -> bool {
         match self.underlying() {
             Element::ProvableCountProvableSumIndexedTree(_, _, _, axes, _) => {
-                let mut i = 0;
-                while i < axes.len() {
-                    if axes[i].1.is_some() {
-                        return true;
-                    }
-                    i += 1;
-                }
-                false
+                any_secondary_set(axes)
             }
             _ => false,
         }
@@ -995,6 +988,17 @@ impl Element {
             other => other,
         })
     }
+}
+
+/// Whether any axis has a populated secondary root key
+/// (`axes.iter().any(|a| a.1.is_some())`), as an index loop without a closure
+/// or an early return.
+fn any_secondary_set(axes: &[(u8, Option<Vec<u8>>)]) -> bool {
+    let mut i = 0;
+    while i < axes.len() && axes[i].1.is_none() {
+        i += 1;
+    }
+    i < axes.len()
 }
 
 #[cfg(test)]

@@ -1054,6 +1054,16 @@ impl std::fmt::Display for ElementType {
     }
 }
 
+/// A legal base-type discriminant inside a counting/summing wrapper: `0..=14`
+/// or `18..=24` (see `ElementType::from_serialized_value`).
+///
+/// Spelled out as comparisons (not a range pattern or `RangeInclusive::contains`)
+/// so the formal-verification toolchain can translate it.
+#[allow(clippy::manual_range_contains)]
+const fn is_base_discriminant(b: u8) -> bool {
+    b <= 14 || (b >= 18 && b <= 24)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2488,14 +2498,4 @@ mod tests {
             );
         }
     }
-}
-
-/// A legal base-type discriminant inside a counting/summing wrapper: `0..=14`
-/// or `18..=24` (see `ElementType::from_serialized_value`).
-///
-/// Spelled out as comparisons (not a range pattern or `RangeInclusive::contains`)
-/// so the formal-verification toolchain can translate it.
-#[allow(clippy::manual_range_contains)]
-const fn is_base_discriminant(b: u8) -> bool {
-    b <= 14 || (b >= 18 && b <= 24)
 }

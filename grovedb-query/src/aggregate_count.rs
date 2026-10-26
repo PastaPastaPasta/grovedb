@@ -19,7 +19,9 @@
 //! sibling modules [`crate::aggregate_sum`] and
 //! [`crate::aggregate_count_and_sum`] with parallel naming.
 
-use crate::{error::Error, query::Query, query_item::QueryItem};
+use indexmap::IndexMap;
+
+use crate::{error::Error, query::Query, query_item::QueryItem, SubqueryBranch};
 
 impl Query {
     /// Creates an aggregate-count-on-range query that counts the elements
@@ -53,9 +55,7 @@ impl Query {
     /// enforce the well-formedness rules (single item, allowed inner kind,
     /// no subqueries, etc.).
     pub fn aggregate_count_on_range(&self) -> Option<&QueryItem> {
-        self.items
-            .iter()
-            .find(|item| item.is_aggregate_count_on_range())
+        first_aggregate_count_on_range(&self.items)
     }
 
     /// Returns `true` if any item in this query — including items inside
@@ -81,13 +81,7 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            for branch in branches.values() {
-                if let Some(sub) = branch.subquery.as_deref()
-                    && sub.has_aggregate_count_on_range_anywhere()
-                {
-                    return true;
-                }
-            }
+            return branches_have_aggregate_count_on_range(branches);
         }
         false
     }
@@ -301,6 +295,38 @@ impl Query {
         // The subquery must validate as a leaf `AggregateCountOnRange` (which is what the
         // proof descent will ultimately consume).
         subquery.validate_leaf_aggregate_count_on_range()
+    }
+}
+/// Whether any conditional branch, in map order, has a subquery for which
+/// `Query::has_aggregate_count_on_range_anywhere` holds, stopping at the first that does. An index
+/// loop without an early return, so the stack stays constant in the number of
+/// branches (the recursion through `has_aggregate_count_on_range_anywhere` is bounded by the
+/// subquery depth).
+fn branches_have_aggregate_count_on_range(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while !found && i < branches.len() {
+        if let Some((_, branch)) = branches.get_index(i)
+            && let Some(sub) = branch.subquery.as_deref()
+        {
+            found = sub.has_aggregate_count_on_range_anywhere();
+        }
+        i += 1;
+    }
+    found
+}
+/// The first item, in order, for which `QueryItem::is_aggregate_count_on_range` holds
+/// (`items.iter().find(..)`), as an index loop without a closure or an early
+/// return.
+fn first_aggregate_count_on_range(items: &[QueryItem]) -> Option<&QueryItem> {
+    let mut i = 0;
+    while i < items.len() && !items[i].is_aggregate_count_on_range() {
+        i += 1;
+    }
+    if i < items.len() {
+        Some(&items[i])
+    } else {
+        None
     }
 }
 

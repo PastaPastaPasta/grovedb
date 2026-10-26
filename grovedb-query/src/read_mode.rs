@@ -30,7 +30,11 @@ use bincode::{
     BorrowDecode, Decode, DecodeUntrusted, Encode,
 };
 
-use crate::{axis_query::AxisQuery, error::Error, query::Query};
+use indexmap::IndexMap;
+
+use crate::{
+    axis_query::AxisQuery, error::Error, query::Query, query_item::QueryItem, SubqueryBranch,
+};
 
 /// A key-ordered read that stops once the running sum of matched
 /// sum-item values reaches a budget. The unified-vocabulary form of
@@ -216,21 +220,28 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            let mut i = 0;
-            while i < branches.len() {
-                let Some((_, branch)) = branches.get_index(i) else {
-                    break;
-                };
-                if let Some(sub) = branch.subquery.as_deref()
-                    && sub.has_read_mode_anywhere()
-                {
-                    return true;
-                }
-                i += 1;
-            }
+            return branches_have_read_mode(branches);
         }
         false
     }
+}
+/// Whether any conditional branch, in map order, has a subquery for which
+/// `Query::has_read_mode_anywhere` holds, stopping at the first that does. An index
+/// loop without an early return, so the stack stays constant in the number of
+/// branches (the recursion through `has_read_mode_anywhere` is bounded by the
+/// subquery depth).
+fn branches_have_read_mode(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while !found && i < branches.len() {
+        if let Some((_, branch)) = branches.get_index(i)
+            && let Some(sub) = branch.subquery.as_deref()
+        {
+            found = sub.has_read_mode_anywhere();
+        }
+        i += 1;
+    }
+    found
 }
 
 #[cfg(test)]

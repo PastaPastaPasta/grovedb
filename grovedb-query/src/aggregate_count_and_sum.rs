@@ -24,7 +24,9 @@
 //! larger `Query` core in `query.rs` stays focused on the
 //! general-purpose query plumbing.
 
-use crate::{error::Error, query::Query, query_item::QueryItem};
+use indexmap::IndexMap;
+
+use crate::{error::Error, query::Query, query_item::QueryItem, SubqueryBranch};
 
 impl Query {
     /// Creates a combined aggregate-count-and-sum-on-range query that
@@ -54,9 +56,7 @@ impl Query {
     /// Mirror of [`Self::aggregate_count_on_range`] /
     /// [`Self::aggregate_sum_on_range`].
     pub fn aggregate_count_and_sum_on_range(&self) -> Option<&QueryItem> {
-        self.items
-            .iter()
-            .find(|item| item.is_aggregate_count_and_sum_on_range())
+        first_aggregate_count_and_sum_on_range(&self.items)
     }
 
     /// Mirror of `Query::has_aggregate_count_on_range_anywhere` /
@@ -74,22 +74,7 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            for (selector, branch) in branches {
-                // Same defense-in-depth as the sum side: the selector
-                // itself is a `QueryItem` and could carry an
-                // `AggregateCountAndSumOnRange` tag even though it
-                // wouldn't be a meaningful matcher. Reject defensively
-                // so a hidden ACASOR in a selector cannot slip past the
-                // aggregate-shape check.
-                if selector.is_aggregate_count_and_sum_on_range() {
-                    return true;
-                }
-                if let Some(sub) = branch.subquery.as_deref()
-                    && sub.has_aggregate_count_and_sum_on_range_anywhere()
-                {
-                    return true;
-                }
-            }
+            return branches_have_aggregate_count_and_sum_on_range(branches);
         }
         false
     }
@@ -308,6 +293,48 @@ impl Query {
         // The subquery must validate as a leaf `AggregateCountAndSumOnRange`.
         subquery.validate_leaf_aggregate_count_and_sum_on_range()
     }
+}
+/// The first item, in order, for which `QueryItem::is_aggregate_count_and_sum_on_range` holds
+/// (`items.iter().find(..)`), as an index loop without a closure or an early
+/// return.
+fn first_aggregate_count_and_sum_on_range(items: &[QueryItem]) -> Option<&QueryItem> {
+    let mut i = 0;
+    while i < items.len() && !items[i].is_aggregate_count_and_sum_on_range() {
+        i += 1;
+    }
+    if i < items.len() {
+        Some(&items[i])
+    } else {
+        None
+    }
+}
+/// Whether any conditional branch, in map order, has a selector tagged as the
+/// aggregate item or a subquery for which `Query::has_aggregate_count_and_sum_on_range_anywhere`
+/// holds (selector first), stopping at the first that does. An index loop
+/// without an early return, so the stack stays constant in the number of
+/// branches.
+fn branches_have_aggregate_count_and_sum_on_range(
+    branches: &IndexMap<QueryItem, SubqueryBranch>,
+) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while !found && i < branches.len() {
+        if let Some((selector, branch)) = branches.get_index(i) {
+            // Same defense-in-depth as the sum side: the selector
+            // itself is a `QueryItem` and could carry an
+            // `AggregateCountAndSumOnRange` tag even though it
+            // wouldn't be a meaningful matcher. Reject defensively
+            // so a hidden ACASOR in a selector cannot slip past the
+            // aggregate-shape check.
+            if selector.is_aggregate_count_and_sum_on_range() {
+                found = true;
+            } else if let Some(sub) = branch.subquery.as_deref() {
+                found = sub.has_aggregate_count_and_sum_on_range_anywhere();
+            }
+        }
+        i += 1;
+    }
+    found
 }
 
 #[cfg(test)]

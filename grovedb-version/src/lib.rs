@@ -1,7 +1,25 @@
 use version::GroveVersion;
+use versioned_feature_core::FeatureVersion;
 
 pub mod error;
 pub mod version;
+
+/// The `UnknownVersionMismatch` error every version-check macro below
+/// returns: built out of line so the checks themselves stay a comparison and
+/// a return.
+#[cold]
+#[doc(hidden)]
+pub fn unknown_version_mismatch(
+    method: &str,
+    known_versions: &[FeatureVersion],
+    received: FeatureVersion,
+) -> error::GroveVersionError {
+    error::GroveVersionError::UnknownVersionMismatch {
+        method: method.to_string(),
+        known_versions: known_versions.to_vec(),
+        received,
+    }
+}
 
 #[macro_export]
 macro_rules! check_grovedb_v0_with_cost {
@@ -9,12 +27,9 @@ macro_rules! check_grovedb_v0_with_cost {
         const EXPECTED_VERSION: u16 = 0;
         if $version != EXPECTED_VERSION {
             return grovedb_costs::CostsExt::wrap_with_cost(
-                Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                    method: $method.to_string(),
-                    known_versions: vec![EXPECTED_VERSION],
-                    received: $version,
-                }
-                .into()),
+                Err(
+                    $crate::unknown_version_mismatch($method, &[EXPECTED_VERSION], $version).into(),
+                ),
                 Default::default(),
             );
         }
@@ -27,12 +42,9 @@ macro_rules! check_grovedb_v1_with_cost {
         const EXPECTED_VERSION: u16 = 1;
         if $version != EXPECTED_VERSION {
             return grovedb_costs::CostsExt::wrap_with_cost(
-                Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                    method: $method.to_string(),
-                    known_versions: vec![EXPECTED_VERSION],
-                    received: $version,
-                }
-                .into()),
+                Err(
+                    $crate::unknown_version_mismatch($method, &[EXPECTED_VERSION], $version).into(),
+                ),
                 Default::default(),
             );
         }
@@ -44,12 +56,9 @@ macro_rules! check_grovedb_v0 {
     ($method:expr, $version:expr) => {{
         const EXPECTED_VERSION: u16 = 0;
         if $version != EXPECTED_VERSION {
-            return Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                method: $method.to_string(),
-                known_versions: vec![EXPECTED_VERSION],
-                received: $version,
-            }
-            .into());
+            return Err(
+                $crate::unknown_version_mismatch($method, &[EXPECTED_VERSION], $version).into(),
+            );
         }
     }};
 }
@@ -61,11 +70,11 @@ macro_rules! check_grovedb_v0_or_v1_with_cost {
         const EXPECTED_VERSION_V1: u16 = 1;
         if $version != EXPECTED_VERSION_V0 && $version != EXPECTED_VERSION_V1 {
             return grovedb_costs::CostsExt::wrap_with_cost(
-                Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                    method: $method.to_string(),
-                    known_versions: vec![EXPECTED_VERSION_V0, EXPECTED_VERSION_V1],
-                    received: $version,
-                }
+                Err($crate::unknown_version_mismatch(
+                    $method,
+                    &[EXPECTED_VERSION_V0, EXPECTED_VERSION_V1],
+                    $version,
+                )
                 .into()),
                 Default::default(),
             );
@@ -79,11 +88,11 @@ macro_rules! check_grovedb_v0_or_v1 {
         const EXPECTED_VERSION_V0: u16 = 0;
         const EXPECTED_VERSION_V1: u16 = 1;
         if $version != EXPECTED_VERSION_V0 && $version != EXPECTED_VERSION_V1 {
-            return Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                method: $method.to_string(),
-                known_versions: vec![EXPECTED_VERSION_V0, EXPECTED_VERSION_V1],
-                received: $version,
-            }
+            return Err($crate::unknown_version_mismatch(
+                $method,
+                &[EXPECTED_VERSION_V0, EXPECTED_VERSION_V1],
+                $version,
+            )
             .into());
         }
         $version
@@ -100,15 +109,15 @@ macro_rules! check_grovedb_v0_v1_or_v2 {
             && $version != EXPECTED_VERSION_V1
             && $version != EXPECTED_VERSION_V2
         {
-            return Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                method: $method.to_string(),
-                known_versions: vec![
+            return Err($crate::unknown_version_mismatch(
+                $method,
+                &[
                     EXPECTED_VERSION_V0,
                     EXPECTED_VERSION_V1,
                     EXPECTED_VERSION_V2,
                 ],
-                received: $version,
-            }
+                $version,
+            )
             .into());
         }
         $version
@@ -125,11 +134,7 @@ macro_rules! dispatch_version {
             let version = $version;
             if $($(version != $version_num)&&*)&&* {
                 return grovedb_costs::CostsExt::wrap_with_cost(
-                    Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                        method: $method.to_string(),
-                        known_versions: vec![$($($version_num),*),*],
-                        received: $version,
-                    }
+                    Err($crate::unknown_version_mismatch($method, &[$($($version_num),*),*], $version)
                     .into()),
                     Default::default(),
                 );
@@ -149,12 +154,9 @@ macro_rules! check_merk_v0_with_cost {
         const EXPECTED_VERSION: u16 = 0;
         if $version != EXPECTED_VERSION {
             return grovedb_costs::CostsExt::wrap_with_cost(
-                Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                    method: $method.to_string(),
-                    known_versions: vec![EXPECTED_VERSION],
-                    received: $version,
-                }
-                .into()),
+                Err(
+                    $crate::unknown_version_mismatch($method, &[EXPECTED_VERSION], $version).into(),
+                ),
                 Default::default(),
             );
         }
@@ -166,12 +168,9 @@ macro_rules! check_merk_v0 {
     ($method:expr, $version:expr) => {{
         const EXPECTED_VERSION: u16 = 0;
         if $version != EXPECTED_VERSION {
-            return Err($crate::error::GroveVersionError::UnknownVersionMismatch {
-                method: $method.to_string(),
-                known_versions: vec![EXPECTED_VERSION],
-                received: $version,
-            }
-            .into());
+            return Err(
+                $crate::unknown_version_mismatch($method, &[EXPECTED_VERSION], $version).into(),
+            );
         }
     }};
 }

@@ -390,18 +390,7 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            let mut i = 0;
-            while i < branches.len() {
-                let Some((_, branch)) = branches.get_index(i) else {
-                    break;
-                };
-                if let Some(sub) = branch.subquery.as_deref()
-                    && sub.has_instance_limit_anywhere()
-                {
-                    return true;
-                }
-                i += 1;
-            }
+            return branches_have_instance_limit(branches);
         }
         false
     }
@@ -419,21 +408,46 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            let mut i = 0;
-            while i < branches.len() {
-                let Some((_, branch)) = branches.get_index(i) else {
-                    break;
-                };
-                if let Some(sub) = branch.subquery.as_deref()
-                    && sub.has_zero_instance_limit_anywhere()
-                {
-                    return true;
-                }
-                i += 1;
-            }
+            return branches_have_zero_instance_limit(branches);
         }
         false
     }
+}
+/// Whether any conditional branch, in map order, has a subquery for which
+/// `Query::has_instance_limit_anywhere` holds, stopping at the first that does. An index
+/// loop without an early return, so the stack stays constant in the number of
+/// branches (the recursion through `has_instance_limit_anywhere` is bounded by the
+/// subquery depth).
+fn branches_have_instance_limit(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while !found && i < branches.len() {
+        if let Some((_, branch)) = branches.get_index(i)
+            && let Some(sub) = branch.subquery.as_deref()
+        {
+            found = sub.has_instance_limit_anywhere();
+        }
+        i += 1;
+    }
+    found
+}
+/// Whether any conditional branch, in map order, has a subquery for which
+/// `Query::has_zero_instance_limit_anywhere` holds, stopping at the first that does. An index
+/// loop without an early return, so the stack stays constant in the number of
+/// branches (the recursion through `has_zero_instance_limit_anywhere` is bounded by the
+/// subquery depth).
+fn branches_have_zero_instance_limit(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
+    let mut found = false;
+    let mut i = 0;
+    while !found && i < branches.len() {
+        if let Some((_, branch)) = branches.get_index(i)
+            && let Some(sub) = branch.subquery.as_deref()
+        {
+            found = sub.has_zero_instance_limit_anywhere();
+        }
+        i += 1;
+    }
+    found
 }
 
 impl Query {

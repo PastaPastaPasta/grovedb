@@ -4332,6 +4332,87 @@ mod resolver_reference_tests {
         }
     }
 
+    // `grovedb-query` predicates over the whole query tree, previous bodies
+    // (the in-loop `return true` over the conditional branches).
+
+    fn ref_has_instance_limit_anywhere(q: &Query) -> bool {
+        if q.limit.is_some() {
+            return true;
+        }
+        if let Some(sub) = q.default_subquery_branch.subquery.as_deref()
+            && ref_has_instance_limit_anywhere(sub)
+        {
+            return true;
+        }
+        if let Some(branches) = &q.conditional_subquery_branches {
+            let mut i = 0;
+            while i < branches.len() {
+                let Some((_, branch)) = branches.get_index(i) else {
+                    break;
+                };
+                if let Some(sub) = branch.subquery.as_deref()
+                    && ref_has_instance_limit_anywhere(sub)
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
+    }
+
+    fn ref_has_zero_instance_limit_anywhere(q: &Query) -> bool {
+        if q.limit == Some(0) {
+            return true;
+        }
+        if let Some(sub) = q.default_subquery_branch.subquery.as_deref()
+            && ref_has_zero_instance_limit_anywhere(sub)
+        {
+            return true;
+        }
+        if let Some(branches) = &q.conditional_subquery_branches {
+            let mut i = 0;
+            while i < branches.len() {
+                let Some((_, branch)) = branches.get_index(i) else {
+                    break;
+                };
+                if let Some(sub) = branch.subquery.as_deref()
+                    && ref_has_zero_instance_limit_anywhere(sub)
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
+    }
+
+    fn ref_has_read_mode_anywhere(q: &Query) -> bool {
+        if q.read_mode.is_some() {
+            return true;
+        }
+        if let Some(sub) = q.default_subquery_branch.subquery.as_deref()
+            && ref_has_read_mode_anywhere(sub)
+        {
+            return true;
+        }
+        if let Some(branches) = &q.conditional_subquery_branches {
+            let mut i = 0;
+            while i < branches.len() {
+                let Some((_, branch)) = branches.get_index(i) else {
+                    break;
+                };
+                if let Some(sub) = branch.subquery.as_deref()
+                    && ref_has_read_mode_anywhere(sub)
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
+    }
+
     fn ref_has_subquery_on_key(has_subquery: &HasSubquery<'_>, key: &[u8]) -> bool {
         match has_subquery {
             HasSubquery::NoSubquery => false,
@@ -4498,12 +4579,26 @@ mod resolver_reference_tests {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let mut counter = 0;
         let (mut items_some, mut read_modes, mut parents) = (0u64, 0u64, 0u64);
+        let (mut instance_limits, mut zero_limits, mut read_mode_trees) = (0u64, 0u64, 0u64);
         for _ in 0..1500 {
             let depth = rng.below(4) as u32;
             let pq = PathQuery::new(
                 path(&mut rng, 2),
                 SizedQuery::new(query(&mut rng, depth, &mut counter), None, None),
             );
+            let q = &pq.query.query;
+            assert_eq!(
+                q.has_instance_limit_anywhere(),
+                ref_has_instance_limit_anywhere(q)
+            );
+            assert_eq!(
+                q.has_zero_instance_limit_anywhere(),
+                ref_has_zero_instance_limit_anywhere(q)
+            );
+            assert_eq!(q.has_read_mode_anywhere(), ref_has_read_mode_anywhere(q));
+            instance_limits += q.has_instance_limit_anywhere() as u64;
+            zero_limits += q.has_zero_instance_limit_anywhere() as u64;
+            read_mode_trees += q.has_read_mode_anywhere() as u64;
             for p in &paths {
                 let new = pq
                     .should_add_parent_tree_at_path(p, grove_version)
@@ -4536,6 +4631,10 @@ mod resolver_reference_tests {
         assert!(items_some > 10_000, "{items_some}");
         assert!(read_modes > 1_000, "{read_modes}");
         assert!(parents > 1_000, "{parents}");
+        // ... and both answers of the tree predicates.
+        for n in [instance_limits, zero_limits, read_mode_trees] {
+            assert!(n > 100 && n < 1_400, "{n}");
+        }
     }
 
     #[test]
