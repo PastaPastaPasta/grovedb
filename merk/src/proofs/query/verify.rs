@@ -284,45 +284,19 @@ impl QueryProofVerify for Query {
         if walk.peek(&self.items).is_some() {
             if walk.current_limit == Some(0) || walk.stopped_early {
             } else {
-                match walk.last_push {
+                if is_bound_witness(&walk.last_push) {
                     // last node in tree was less than queried item
-                    Some(Node::KV(..)) => {}
-                    Some(Node::KVDigest(..)) => {}
-                    Some(Node::KVDigestCount(..)) => {}
-                    Some(Node::KVRefValueHash(..)) => {}
-                    Some(Node::KVValueHash(..)) => {}
-                    Some(Node::KVBackwardsReferencesValueHash(..)) => {}
-                    Some(Node::KVCount(..)) => {}
-                    Some(Node::KVValueHashFeatureType(..)) => {}
-                    Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
-                    Some(Node::KVRefValueHashCount(..)) => {}
-                    // ProvableSumTree key-bearing nodes are also acceptable
-                    // absence-proof boundaries.
-                    Some(Node::KVSum(..)) => {}
-                    Some(Node::KVDigestSum(..)) => {}
-                    Some(Node::KVRefValueHashSum(..)) => {}
-                    // ProvableCountProvableSumTree (dual-axis) key-bearing
-                    // nodes are also acceptable absence-proof boundaries.
-                    Some(Node::KVCountSum(..)) => {}
-                    Some(Node::KVDigestCountSum(..)) => {}
-                    Some(Node::KVRefValueHashCountSum(..)) => {}
-
+                } else if walk.limit_mode == ProofLimitMode::UpperBound && !walk.output.is_empty() {
                     // Upper-bound mode: the prover stopped after the results so
                     // far and hid the rest; the remaining items are unproven.
-                    _ if walk.limit_mode == ProofLimitMode::UpperBound
-                        && !walk.output.is_empty() =>
-                    {
-                        walk.stopped_early = true;
-                    }
-
+                    walk.stopped_early = true;
+                } else {
                     // proof contains abridged data so we cannot verify absence of
                     // remaining query items
-                    _ => {
-                        return Err(Error::InvalidProofError(
-                            "Proof is missing data for query".to_string(),
-                        ))
-                        .wrap_with_cost(cost);
-                    }
+                    return Err(Error::InvalidProofError(
+                        "Proof is missing data for query".to_string(),
+                    ))
+                    .wrap_with_cost(cost);
                 }
             }
         }
@@ -440,89 +414,27 @@ impl QueryWalk {
                 // this is the first data we have encountered for this query item
                 if self.left_to_right {
                     // ensure lower bound of query item is proven
-                    match self.last_push {
-                        // lower bound is proven - we have an exact match
-                        // ignoring the case when the lower bound is unbounded
-                        // as it's not possible the get an exact key match for
-                        // an unbounded value
-                        _ if Some(key.as_slice()) == query_item.lower_bound().0 => {}
-
-                        // lower bound is proven - this is the leftmost node
-                        // in the tree
-                        None => {}
-
-                        // lower bound is proven - the preceding tree node
-                        // is lower than the bound
-                        Some(Node::KV(..)) => {}
-                        Some(Node::KVDigest(..)) => {}
-                        Some(Node::KVDigestCount(..)) => {}
-                        Some(Node::KVDigestSum(..)) => {}
-                        Some(Node::KVRefValueHash(..)) => {}
-                        Some(Node::KVValueHash(..)) => {}
-                        Some(Node::KVBackwardsReferencesValueHash(..)) => {}
-                        Some(Node::KVValueHashFeatureType(..)) => {}
-                        Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
-                        Some(Node::KVRefValueHashCount(..)) => {}
-                        Some(Node::KVRefValueHashSum(..)) => {}
-                        Some(Node::KVCount(..)) => {}
-                        Some(Node::KVSum(..)) => {}
-                        // ProvableCountProvableSumTree (dual-axis)
-                        // key-bearing nodes are also acceptable
-                        // bound-proving boundaries.
-                        Some(Node::KVCountSum(..)) => {}
-                        Some(Node::KVDigestCountSum(..)) => {}
-                        Some(Node::KVRefValueHashCountSum(..)) => {}
-
-                        // cannot verify lower bound - we have an abridged
-                        // tree, so we cannot tell what the preceding key was
-                        Some(_) => {
-                            return Err(Error::InvalidProofError(
-                                "Cannot verify lower bound of queried range".to_string(),
-                            ));
-                        }
+                    if !(Some(key.as_slice()) == query_item.lower_bound().0
+                        || self.last_push.is_none()
+                        || is_bound_witness(&self.last_push))
+                    {
+                        // cannot verify the bound - the preceding push is abridged,
+                        // so we cannot tell what the preceding key was
+                        return Err(Error::InvalidProofError(
+                            "Cannot verify lower bound of queried range".to_string(),
+                        ));
                     }
                 } else {
                     // ensure upper bound of query item is proven
-                    match self.last_push {
-                        // upper bound is proven - we have an exact match
-                        // ignoring the case when the upper bound is unbounded
-                        // as it's not possible the get an exact key match for
-                        // an unbounded value
-                        _ if Some(key.as_slice()) == query_item.upper_bound().0 => {}
-
-                        // lower bound is proven - this is the rightmost node
-                        // in the tree
-                        None => {}
-
-                        // upper bound is proven - the preceding tree node
-                        // is greater than the bound
-                        Some(Node::KV(..)) => {}
-                        Some(Node::KVDigest(..)) => {}
-                        Some(Node::KVDigestCount(..)) => {}
-                        Some(Node::KVDigestSum(..)) => {}
-                        Some(Node::KVRefValueHash(..)) => {}
-                        Some(Node::KVValueHash(..)) => {}
-                        Some(Node::KVBackwardsReferencesValueHash(..)) => {}
-                        Some(Node::KVValueHashFeatureType(..)) => {}
-                        Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
-                        Some(Node::KVRefValueHashCount(..)) => {}
-                        Some(Node::KVRefValueHashSum(..)) => {}
-                        Some(Node::KVCount(..)) => {}
-                        Some(Node::KVSum(..)) => {}
-                        // ProvableCountProvableSumTree (dual-axis)
-                        // key-bearing nodes are also acceptable
-                        // upper-bound-proving boundaries.
-                        Some(Node::KVCountSum(..)) => {}
-                        Some(Node::KVDigestCountSum(..)) => {}
-                        Some(Node::KVRefValueHashCountSum(..)) => {}
-
-                        // cannot verify upper bound - we have an abridged
-                        // tree so we cannot tell what the previous key was
-                        Some(_) => {
-                            return Err(Error::InvalidProofError(
-                                "Cannot verify upper bound of queried range".to_string(),
-                            ));
-                        }
+                    if !(Some(key.as_slice()) == query_item.upper_bound().0
+                        || self.last_push.is_none()
+                        || is_bound_witness(&self.last_push))
+                    {
+                        // cannot verify the bound - the preceding push is abridged,
+                        // so we cannot tell what the preceding key was
+                        return Err(Error::InvalidProofError(
+                            "Cannot verify upper bound of queried range".to_string(),
+                        ));
                     }
                 }
             }
@@ -591,7 +503,7 @@ impl QueryWalk {
                             }
                         );
                     }
-                    // add data to self.output
+                    // add data to output
                     self.output.push(ProvedKeyOptionalValue {
                         key: key.clone(),
                         value: Some(val.clone()),
@@ -843,8 +755,8 @@ impl QueryWalk {
             | Node::KVHashSum(..)
             | Node::KVHashCountSum(..) => {
                 if self.in_range {
-                    // `self.in_range` is only set by a node the current item
-                    // contains, which is a result, so `self.output` is never
+                    // `in_range` is only set by a node the current item
+                    // contains, which is a result, so `output` is never
                     // empty here. The check keeps the "no stop before
                     // the first result" rule explicit, as at the other
                     // stopping point.
@@ -874,7 +786,7 @@ impl QueryWalk {
                 // hash from the embedded `(kv_hash, l, r, count)` while
                 // *ignoring* any reconstructed children. A malicious
                 // prover could therefore hang fake KV pushes under a
-                // `HashWithCount`, satisfy `execute_node` from those
+                // `HashWithCount`, satisfy `visit_key` from those
                 // pushes (so they appear as query results) while still
                 // preserving the parent's hash chain. Fail fast here so
                 // the regular query path can never accept one.
@@ -969,6 +881,32 @@ impl QueryWalk {
 
         Ok(())
     }
+}
+
+/// A pushed node that reveals a key, so it witnesses the bound next to it:
+/// nothing lies between it and the following push.
+fn is_bound_witness(node: &Option<Node>) -> bool {
+    matches!(
+        node,
+        Some(
+            Node::KV(..)
+                | Node::KVBackwardsReferencesValueHash(..)
+                | Node::KVCount(..)
+                | Node::KVCountSum(..)
+                | Node::KVDigest(..)
+                | Node::KVDigestCount(..)
+                | Node::KVDigestCountSum(..)
+                | Node::KVDigestSum(..)
+                | Node::KVRefValueHash(..)
+                | Node::KVRefValueHashCount(..)
+                | Node::KVRefValueHashCountSum(..)
+                | Node::KVRefValueHashSum(..)
+                | Node::KVSum(..)
+                | Node::KVValueHash(..)
+                | Node::KVValueHashFeatureType(..)
+                | Node::KVValueHashFeatureTypeWithChildHash(..)
+        )
+    )
 }
 
 /// `key` comes before the start of `query_item` in walk order, so the walk
@@ -1437,7 +1375,7 @@ mod provable_count_provable_sum_tree_bound_regression_tests {
 
     /// A regular range query against a PCPS that includes every key in
     /// the tree — exercises every dual-axis Node variant that the
-    /// verifier's `execute_node` callback dispatches on (KVCountSum
+    /// verifier's `visit_key` dispatches on (KVCountSum
     /// for queried Items, KVHashCountSum for path nodes,
     /// KVDigestCountSum for boundary nodes). Without the dual-axis
     /// arms in `execute_proof`'s match the proof would fail to verify.
