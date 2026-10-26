@@ -6,11 +6,13 @@ use grovedb_query::QueryItem;
 
 #[cfg(feature = "minimal")]
 use crate::proofs::query::{Map, MapBuilder};
+#[cfg(feature = "minimal")]
+use crate::proofs::tree::execute;
 use crate::{
     error::Error,
     proofs::{
         hex_to_ascii,
-        tree::{execute, MAX_PROOF_OPS},
+        tree::{execute_with_visitor, NodeVisitor, MAX_PROOF_OPS},
         Decoder, Node, Op, Query,
     },
     tree::{combine_hash, value_hash},
@@ -222,7 +224,7 @@ impl QueryProofVerify for Query {
         }
         let mut cost = OperationCost::default();
 
-        let mut walk = QueryWalk {
+        let walk = QueryWalk {
             left_to_right,
             consumed: 0,
             in_range: false,
@@ -265,9 +267,12 @@ impl QueryProofVerify for Query {
             left_to_right,
         };
 
-        let root_wrapped = execute(&mut oriented_ops, true, |node| {
-            walk.visit(&self.items, node)
-        });
+        let mut visitor = WalkVisitor {
+            walk,
+            items: &self.items,
+        };
+        let root_wrapped = execute_with_visitor(&mut oriented_ops, true, true, &mut visitor);
+        let mut walk = visitor.walk;
 
         let root = cost_return_on_error!(&mut cost, root_wrapped);
 
@@ -935,6 +940,20 @@ fn past_item_end(query_item: &QueryItem, key: &[u8], left_to_right: bool) -> boo
         query_item.upper_bound().0.is_some() && Some(key) >= query_item.upper_bound().0
     } else {
         query_item.lower_bound().0.is_some() && Some(key) <= query_item.lower_bound().0
+    }
+}
+
+/// The node visitor of the query walk: the walk state plus the query items it
+/// matches against. Passed to [`execute_with_visitor`] by `&mut`, so the state
+/// is read back after execution.
+struct WalkVisitor<'q> {
+    walk: QueryWalk,
+    items: &'q [QueryItem],
+}
+
+impl NodeVisitor for WalkVisitor<'_> {
+    fn visit_node(&mut self, node: &Node) -> Result<(), Error> {
+        self.walk.visit(self.items, node)
     }
 }
 

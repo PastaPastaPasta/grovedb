@@ -56,8 +56,8 @@ impl Iterator for Decoder<'_> {
         match self.inner.next_core() {
             None => None,
             Some(Ok(op)) => Some(Ok(op)),
-            Some(Err(error)) => Some(Err(crate::error::Error::InvalidProofError(
-                grovedb_query::proofs::op_decode_error_message(&error),
+            Some(Err(e)) => Some(Err(crate::error::Error::InvalidProofError(
+                grovedb_query::proofs::op_decode_error_message(&e),
             ))),
         }
     }

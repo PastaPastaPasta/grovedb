@@ -127,8 +127,8 @@ impl Tree {
     /// Gets or computes the hash for this tree node.
     #[cfg(any(feature = "minimal", feature = "verify"))]
     pub fn hash(&self) -> CostContext<CryptoHash> {
-        fn compute_hash(tree: &Tree, kv_hash: CryptoHash) -> CostContext<CryptoHash> {
-            node_hash(&kv_hash, &tree.child_hash(true), &tree.child_hash(false))
+        fn compute_hash(node: &Tree, kv_hash: CryptoHash) -> CostContext<CryptoHash> {
+            node_hash(&kv_hash, &node.child_hash(true), &node.child_hash(false))
         }
 
         match &self.node {
@@ -751,6 +751,38 @@ where
     I: IntoIterator<Item = Result<Op, Error>>,
     F: FnMut(&Node) -> Result<(), Error>,
 {
+    execute_with_visitor(ops, collapse, verify_avl_balance, &mut visit_node)
+}
+
+#[cfg(any(feature = "minimal", feature = "verify"))]
+/// The callback [`execute_with_visitor`] invokes for every pushed node, in
+/// push order. Every `FnMut(&Node) -> Result<(), Error>` closure is one.
+pub trait NodeVisitor {
+    /// Visit one pushed node; an `Err` halts execution.
+    fn visit_node(&mut self, node: &Node) -> Result<(), Error>;
+}
+
+#[cfg(any(feature = "minimal", feature = "verify"))]
+impl<F: FnMut(&Node) -> Result<(), Error>> NodeVisitor for F {
+    fn visit_node(&mut self, node: &Node) -> Result<(), Error> {
+        self(node)
+    }
+}
+
+#[cfg(any(feature = "minimal", feature = "verify"))]
+/// [`execute_with_options`] with the per-node callback given as a
+/// [`NodeVisitor`] borrowed mutably, so a caller can keep state in a plain
+/// struct instead of a closure capturing it by `&mut`.
+pub fn execute_with_visitor<I, V>(
+    ops: I,
+    collapse: bool,
+    verify_avl_balance: bool,
+    visitor: &mut V,
+) -> CostResult<Tree, Error>
+where
+    I: IntoIterator<Item = Result<Op, Error>>,
+    V: NodeVisitor + ?Sized,
+{
     let mut cost = OperationCost::default();
 
     let mut stack: Vec<Tree> = Vec::with_capacity(32);
@@ -877,7 +909,7 @@ where
                     maybe_last_key = Some(key.clone());
                 }
 
-                cost_return_on_error_no_add!(cost, visit_node(&node));
+                cost_return_on_error_no_add!(cost, visitor.visit_node(&node));
 
                 let tree: Tree = node.into();
                 stack.push(tree);
@@ -922,7 +954,7 @@ where
                     maybe_last_key = Some(key.clone());
                 }
 
-                cost_return_on_error_no_add!(cost, visit_node(&node));
+                cost_return_on_error_no_add!(cost, visitor.visit_node(&node));
 
                 let tree: Tree = node.into();
                 stack.push(tree);
