@@ -132,6 +132,34 @@ impl ParentCommitment<'_> {
     }
 }
 
+/// The root an MMR lower layer proof yields, before it is bound to the
+/// parent row.
+enum MmrLowerRoot {
+    /// An empty MMR (`mmr_size == 0`, no leaves); its root is `[0u8; 32]`.
+    Empty,
+    /// The root computed from the proof, with the leaves it verified and the
+    /// element's `mmr_size` (equal to the proof's).
+    Proved {
+        root: CryptoHash,
+        leaves: grovedb_merkle_mountain_range::VerifiedLeaves,
+        mmr_size: u64,
+    },
+}
+
+/// The root a dense lower layer proof yields, before it is bound to the
+/// parent row.
+enum DenseLowerRoot {
+    /// Root only (`report_contents` unset): nothing is reported.
+    RootOnly(CryptoHash),
+    /// The root `verify_for_query` computed, with the entries the query
+    /// selects and the query's direction.
+    Selected {
+        root: CryptoHash,
+        entries: Vec<(u16, Vec<u8>)>,
+        left_to_right: bool,
+    },
+}
+
 /// `Error::InvalidProof` for a V1 verifier rejection. Out of line so the
 /// verifier clones the query only on the error path.
 #[cold]
@@ -3012,6 +3040,10 @@ impl GroveDb {
     /// The computed MMR root is the child hash of the parent Merk row
     /// (`combine_hash(value_hash || mmr_root)`) and is bound to `parent`
     /// before any leaf is reported.
+    ///
+    /// Root, then bind, then report: `mmr_lower_root` derives the root
+    /// without touching `result` or `limit_left`, this function binds it,
+    /// and only then does `report_mmr_leaves` add rows.
     #[allow(clippy::too_many_arguments)]
     fn verify_mmr_lower_layer<S: RowSink>(
         mmr_bytes: &[u8],
@@ -3024,6 +3056,49 @@ impl GroveDb {
         report_contents: bool,
         grove_version: &GroveVersion,
     ) -> Result<(), Error> {
+        match Self::mmr_lower_root(mmr_bytes, element, query)? {
+            // An empty MMR (mmr_size == 0) has no leaves to verify: its root
+            // is the empty-MMR root hash ([0u8; 32]).
+            MmrLowerRoot::Empty => parent.bind(query, &[0u8; 32]),
+            MmrLowerRoot::Proved {
+                root,
+                leaves,
+                mmr_size,
+            } => {
+                // Bind the root to the parent row
+                // (combine_hash(value_hash || mmr_root)) before reporting
+                // any leaf.
+                parent.bind(query, &root)?;
+
+                // Root only: the parent element is bound and this layer's
+                // leaves are not reported, so there is no query at this path
+                // to check completeness/succinctness against.
+                if !report_contents {
+                    return Ok(());
+                }
+
+                Self::report_mmr_leaves(
+                    leaves,
+                    mmr_size,
+                    path,
+                    limit_left,
+                    result,
+                    query,
+                    grove_version,
+                )
+            }
+        }
+    }
+
+    /// Decode an MMR lower layer proof, check it against the element's
+    /// `mmr_size`, and compute its root. Reads neither the result set nor
+    /// the row limit; the caller binds the root before anything is
+    /// reported.
+    fn mmr_lower_root(
+        mmr_bytes: &[u8],
+        element: &Element,
+        query: &PathQuery,
+    ) -> Result<MmrLowerRoot, Error> {
         // Extract the MMR size from the element
         let element_mmr_size = match element {
             Element::MmrTree(mmr_size, ..) => *mmr_size,
@@ -3051,10 +3126,10 @@ impl GroveDb {
         }
 
         // An empty MMR (mmr_size == 0) has no leaves to verify: its root is
-        // the empty-MMR root hash ([0u8; 32]).
+        // the empty-MMR root hash ([0u8; 32]), which the caller binds.
         if mmr_proof.leaves().is_empty() {
             if element_mmr_size == 0 {
-                return parent.bind(query, &[0u8; 32]);
+                return Ok(MmrLowerRoot::Empty);
             }
             return Err(invalid_proof(
                 query,
@@ -3065,20 +3140,30 @@ impl GroveDb {
             ));
         }
 
-        // Compute root from the proof and bind it to the parent row
-        // (combine_hash(value_hash || mmr_root)) before reporting any leaf.
+        // Compute root from the proof; the caller binds it to the parent row.
         let (mmr_root, verified_leaves) = mmr_proof
             .verify_and_get_root()
             .map_err(|e| invalid_proof(query, format!("{}", e)))?;
-        parent.bind(query, &mmr_root)?;
+        Ok(MmrLowerRoot::Proved {
+            root: mmr_root,
+            leaves: verified_leaves,
+            mmr_size: element_mmr_size,
+        })
+    }
 
-        // Root only: the parent element is bound and this layer's leaves
-        // are not reported, so there is no query at this path to check
-        // completeness/succinctness against.
-        if !report_contents {
-            return Ok(());
-        }
-
+    /// Report the proved MMR leaves the query selects at `path`, in the
+    /// query's direction, charging `limit_left`. `verified_leaves` and
+    /// `element_mmr_size` come from `mmr_lower_root`, whose root the caller
+    /// has already bound to the parent row.
+    fn report_mmr_leaves<S: RowSink>(
+        verified_leaves: grovedb_merkle_mountain_range::VerifiedLeaves,
+        element_mmr_size: u64,
+        path: &[&[u8]],
+        limit_left: &mut Option<u16>,
+        result: &mut S,
+        query: &PathQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<(), Error> {
         // Get the sub-query items for this path to enforce succinctness.
         let sub_query = match query.query_items_at_path(path, grove_version)? {
             Some(sub_query) => sub_query,
@@ -3404,6 +3489,11 @@ impl GroveDb {
     /// Verify a DenseAppendOnlyFixedSizeTree lower layer proof and add results.
     /// The computed dense root is the child hash of the parent Merk row and
     /// is bound to `parent` before any entry is reported.
+    ///
+    /// Root, then bind, then report: `dense_lower_root` derives the root
+    /// (and, when reporting, the selected entries) without touching `result`
+    /// or `limit_left`, this function binds it, and only then does
+    /// `report_dense_entries` add rows.
     #[allow(clippy::too_many_arguments)]
     fn verify_dense_tree_lower_layer<S: RowSink>(
         dense_bytes: &[u8],
@@ -3416,6 +3506,47 @@ impl GroveDb {
         report_contents: bool,
         grove_version: &GroveVersion,
     ) -> Result<(), Error> {
+        match Self::dense_lower_root(
+            dense_bytes,
+            element,
+            path,
+            query,
+            report_contents,
+            grove_version,
+        )? {
+            DenseLowerRoot::RootOnly(computed_root) => parent.bind(query, &computed_root),
+            DenseLowerRoot::Selected {
+                root,
+                entries,
+                left_to_right,
+            } => {
+                parent.bind(query, &root)?;
+                Self::report_dense_entries(
+                    entries,
+                    left_to_right,
+                    path,
+                    limit_left,
+                    result,
+                    grove_version,
+                )
+            }
+        }
+    }
+
+    /// Decode a dense lower layer proof and compute its root. When
+    /// `report_contents` is set, also check it against the query at `path`
+    /// (completeness and soundness) and return the selected entries; the
+    /// root computation differs between the two modes. Reads neither the
+    /// result set nor the row limit; the caller binds the root before
+    /// anything is reported.
+    fn dense_lower_root(
+        dense_bytes: &[u8],
+        element: &Element,
+        path: &[&[u8]],
+        query: &PathQuery,
+        report_contents: bool,
+        grove_version: &GroveVersion,
+    ) -> Result<DenseLowerRoot, Error> {
         // Extract the count and height from the authenticated element
         let (element_count, element_height) = match element {
             Element::DenseAppendOnlyFixedSizeTree(count, height, _) => (*count, *height),
@@ -3438,7 +3569,7 @@ impl GroveDb {
             let (computed_root, _entries): ([u8; 32], Vec<(u16, Vec<u8>)>) = dense_proof
                 .verify_and_get_root(element_height, element_count)
                 .map_err(|e| invalid_proof(query, format!("{}", e)))?;
-            return parent.bind(query, &computed_root);
+            return Ok(DenseLowerRoot::RootOnly(computed_root));
         }
 
         // Get the sub-query items for this path to build a query for
@@ -3466,14 +3597,30 @@ impl GroveDb {
         let (computed_root, verified_entries): ([u8; 32], Vec<(u16, Vec<u8>)>) = dense_proof
             .verify_for_query(&level_query, element_height, element_count)
             .map_err(|e| invalid_proof(query, format!("{}", e)))?;
-        parent.bind(query, &computed_root)?;
+        Ok(DenseLowerRoot::Selected {
+            root: computed_root,
+            entries: verified_entries,
+            left_to_right: sub_query.left_to_right,
+        })
+    }
 
+    /// Report the dense entries `dense_lower_root` selected, in the query's
+    /// direction (`left_to_right`), charging `limit_left`. The caller has
+    /// already bound the root they were proved against to the parent row.
+    fn report_dense_entries<S: RowSink>(
+        verified_entries: Vec<(u16, Vec<u8>)>,
+        left_to_right: bool,
+        path: &[&[u8]],
+        limit_left: &mut Option<u16>,
+        result: &mut S,
+        grove_version: &GroveVersion,
+    ) -> Result<(), Error> {
         // Add each verified entry to the result set
         // Follow the query direction so a cap keeps the intended end of
         // the range.
         let mut verified_entries = verified_entries;
         verified_entries.sort_by_key(|(position, _)| *position);
-        if !sub_query.left_to_right {
+        if !left_to_right {
             verified_entries.reverse();
         }
         for (position, value) in verified_entries {
