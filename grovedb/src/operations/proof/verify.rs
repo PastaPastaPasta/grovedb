@@ -3630,9 +3630,9 @@ impl GroveDb {
             grovedb_dense_fixed_sized_merkle_tree::DenseTreeProof::decode_from_slice(dense_bytes)
                 .map_err(|e| Error::CorruptedData(format!("{}", e)))?;
 
-        // Root only: the parent element is bound and this layer's entries
-        // are not reported, so there is no query at this path to check
-        // completeness/soundness against.
+        // Root only: the caller binds the parent element to this root and
+        // this layer's entries are not reported, so there is no query at
+        // this path to check completeness/soundness against.
         if !report_contents {
             let (computed_root, _entries): ([u8; 32], Vec<(u16, Vec<u8>)>) = dense_proof
                 .verify_and_get_root(element_height, element_count)
