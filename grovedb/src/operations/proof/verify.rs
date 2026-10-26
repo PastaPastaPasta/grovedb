@@ -181,16 +181,106 @@ fn corrupted_layer_path(context: &str, path: &[&[u8]], query: &PathQuery) -> Err
     ))
 }
 
-/// Owned copy of a borrowed path, component by component, in order. An index
-/// loop rather than `iter().map(..).collect()`.
+/// Owned copy of a borrowed path, component by component, in order, rather
+/// than `iter().map(..).collect()`.
 fn path_to_owned(path: &[&[u8]]) -> Vec<Vec<u8>> {
     let mut owned = Vec::with_capacity(path.len());
-    let mut i = 0;
-    while i < path.len() {
-        owned.push(path[i].to_vec());
-        i += 1;
-    }
+    push_owned_components(path, 0, &mut owned);
     owned
+}
+
+/// Push `path[i..]` onto `owned`, in order. Recursive rather than a loop; the
+/// depth is `path.len() - i`, and a V1 layer path is at most one component
+/// per proof level (`MAX_PROOF_DEPTH`).
+fn push_owned_components(path: &[&[u8]], i: usize, owned: &mut Vec<Vec<u8>>) {
+    if i < path.len() {
+        owned.push(path[i].to_vec());
+        push_owned_components(path, i + 1, owned);
+    }
+}
+
+/// Whether a V1 row whose lower layer the proof does not carry is reported
+/// as a result row (`verify_terminal_row`): an item, or an element no subquery
+/// descends into that the options allow to be reported (an empty `Tree` only
+/// with `include_empty_trees_in_result`). Evaluated left to right as
+/// `item || !descends && (include_empty || !empty_tree)`.
+fn is_terminal_row(
+    element: &Element,
+    internal_query: &SinglePathSubquery<'_>,
+    key: &[u8],
+    options: &VerifyOptions,
+) -> bool {
+    if element.is_any_item() {
+        return true;
+    }
+    if internal_query.has_subquery_or_matching_in_path_on_key(key) {
+        return false;
+    }
+    if options.include_empty_trees_in_result {
+        return true;
+    }
+    !is_empty_plain_tree(element)
+}
+
+/// `matches!(element, Element::Tree(None, _))`: a plain `Tree` with no root
+/// key.
+fn is_empty_plain_tree(element: &Element) -> bool {
+    matches!(element, Element::Tree(None, _))
+}
+
+/// Whether a layer is a level `query_items_at_path` synthesized for a path
+/// component and its items are exactly one `QueryItem::Key`, i.e.
+/// `synthesized_path_component && matches!(items.as_slice(), [Key(_)])`.
+fn is_single_key_synthesized_level(internal_query: &SinglePathSubquery<'_>) -> bool {
+    if !internal_query.synthesized_path_component {
+        return false;
+    }
+    let items = internal_query.items.as_slice();
+    if items.len() != 1 {
+        return false;
+    }
+    matches!(items[0], grovedb_merk::proofs::query::QueryItem::Key(_))
+}
+
+/// Whether a terminally reported tree must come with a verified child hash:
+/// every non-empty Merk tree, and from `terminal_non_merk_tree_child_hash`
+/// version 1 on, every tree `is_non_empty_tree` covers.
+fn terminal_requires_child_hash(element: &Element, grove_version: &GroveVersion) -> bool {
+    element.is_non_empty_merk_tree()
+        || (grove_version
+            .grovedb_versions
+            .operations
+            .proof
+            .terminal_non_merk_tree_child_hash
+            >= 1
+            && element.is_non_empty_tree())
+}
+
+/// The limit a V1 layer's Merk proof runs under: the tighter of the global
+/// and instance budgets for a pure terminal layer (`HasSubquery::NoSubquery`),
+/// the global budget otherwise. A function of its own so the choice reads the
+/// limit state through one shared borrow, matching every variant (no
+/// wildcard arm).
+fn v1_layer_limit(
+    has_subquery: &crate::query::HasSubquery<'_>,
+    limit_state: &super::V1LimitState,
+    frame_instance: Option<u16>,
+) -> Option<u16> {
+    match has_subquery {
+        crate::query::HasSubquery::NoSubquery => limit_state.effective_layer_limit(frame_instance),
+        crate::query::HasSubquery::Always | crate::query::HasSubquery::Conditionally(_) => {
+            limit_state.global
+        }
+    }
+}
+
+/// Charge an empty V1 layer to the global budget when the prove options ask
+/// for it (`decrease_limit_on_empty_sub_query_result`); per-instance budgets
+/// bound rows, so they are not charged.
+fn charge_empty_v1_layer(limit_state: &mut super::V1LimitState, decrease_limit: bool) {
+    if decrease_limit {
+        limit_state.charge_empty_layer();
+    }
 }
 
 /// Where a V1 walk puts the rows it verifies.
@@ -1888,11 +1978,7 @@ impl GroveDb {
         // runs on a synthesized level, where the direction read off
         // the stream trivially matches it (`proof_stream_direction`
         // already refuses a mixed stream).
-        let single_key_synthesized_level = internal_query.synthesized_path_component
-            && matches!(
-                internal_query.items.as_slice(),
-                [grovedb_merk::proofs::query::QueryItem::Key(_)]
-            );
+        let single_key_synthesized_level = is_single_key_synthesized_level(&internal_query);
         let left_to_right = if single_key_synthesized_level {
             grovedb_merk::proofs::query::proof_stream_direction(merk_proof_bytes)
                 .map_err(|e| {
@@ -1924,14 +2010,7 @@ impl GroveDb {
         // child may still owe rows). Prover and verifier must derive
         // the identical value here or honest proofs fail the
         // more-data-than-limit check.
-        let layer_limit = if matches!(
-            internal_query.has_subquery,
-            crate::query::HasSubquery::NoSubquery
-        ) {
-            limit_state.effective_layer_limit(frame_instance)
-        } else {
-            limit_state.global
-        };
+        let layer_limit = v1_layer_limit(&internal_query.has_subquery, limit_state, frame_instance);
 
         let (root_hash, merk_result) = level_query
             .execute_proof(
@@ -1951,11 +2030,10 @@ impl GroveDb {
         let mut verified_keys = BTreeSet::new();
 
         if merk_result.result_set.is_empty() {
-            if prove_options.decrease_limit_on_empty_sub_query_result {
-                // Global budget only — empty-layer charges bound
-                // traversal work, per-instance budgets bound rows.
-                limit_state.charge_empty_layer();
-            }
+            charge_empty_v1_layer(
+                limit_state,
+                prove_options.decrease_limit_on_empty_sub_query_result,
+            );
         } else {
             let ctx = V1LayerCtx {
                 lower_layers,
@@ -1968,23 +2046,18 @@ impl GroveDb {
                 grove_version,
             };
             let rows = merk_result.result_set;
-            let mut i = 0;
-            while i < rows.len() {
-                match Self::verify_v1_row(
-                    ctx,
-                    &rows[i],
-                    &mut verified_keys,
-                    limit_state,
-                    &mut frame_instance,
-                    result,
-                    axis_outcomes,
-                    last_parent_tree_type,
-                )? {
-                    RowFlow::Continue => {}
-                    RowFlow::Break => break,
-                }
-                i += 1;
-            }
+            Self::verify_v1_rows(
+                ctx,
+                &rows,
+                0,
+                rows.len(),
+                &mut verified_keys,
+                limit_state,
+                &mut frame_instance,
+                result,
+                axis_outcomes,
+                last_parent_tree_type,
+            )?;
         }
 
         // Succinctness check: reject proof if it contains lower layers
@@ -2002,6 +2075,73 @@ impl GroveDb {
         }
 
         Ok(root_hash)
+    }
+
+    /// Verify `rows[lo..hi]` in order, stopping at the first row that
+    /// returns `RowFlow::Break` (which is returned) or an error: the row
+    /// loop of `verify_layer_proof_v1`.
+    ///
+    /// The range is halved, the left half verified, and the right half
+    /// verified only if the left one did not stop, so the rows are visited
+    /// in exactly the order and with exactly the early exits of
+    /// `for row in rows { match verify_v1_row(row)? { Break => break, .. } }`.
+    /// Recursion rather than a loop; halving keeps the depth at
+    /// `log2(hi - lo) + 1`.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_v1_rows<S: RowSink>(
+        ctx: V1LayerCtx<'_>,
+        rows: &[ProvedKeyOptionalValue],
+        lo: usize,
+        hi: usize,
+        verified_keys: &mut BTreeSet<Vec<u8>>,
+        limit_state: &mut super::V1LimitState,
+        frame_instance: &mut Option<u16>,
+        result: &mut S,
+        axis_outcomes: &mut Vec<AxisWalkOutcome>,
+        last_parent_tree_type: &mut Option<TreeFeatureType>,
+    ) -> Result<RowFlow, Error> {
+        if hi <= lo {
+            Ok(RowFlow::Continue)
+        } else if hi - lo == 1 {
+            Self::verify_v1_row(
+                ctx,
+                &rows[lo],
+                verified_keys,
+                limit_state,
+                frame_instance,
+                result,
+                axis_outcomes,
+                last_parent_tree_type,
+            )
+        } else {
+            let mid = lo + (hi - lo) / 2;
+            match Self::verify_v1_rows(
+                ctx,
+                rows,
+                lo,
+                mid,
+                verified_keys,
+                limit_state,
+                frame_instance,
+                result,
+                axis_outcomes,
+                last_parent_tree_type,
+            )? {
+                RowFlow::Break => Ok(RowFlow::Break),
+                RowFlow::Continue => Self::verify_v1_rows(
+                    ctx,
+                    rows,
+                    mid,
+                    hi,
+                    verified_keys,
+                    limit_state,
+                    frame_instance,
+                    result,
+                    axis_outcomes,
+                    last_parent_tree_type,
+                ),
+            }
+        }
     }
 
     /// One row of a V1 layer: the body of the row loop in
@@ -2243,11 +2383,7 @@ impl GroveDb {
                         unreachable!("unwrapped above")
                     }
                 }
-            } else if element.is_any_item()
-                || !internal_query.has_subquery_or_matching_in_path_on_key(key)
-                    && (options.include_empty_trees_in_result
-                        || !matches!(element, Element::Tree(None, _)))
-            {
+            } else if is_terminal_row(&element, internal_query, key, options) {
                 return Self::verify_terminal_row(
                     ctx,
                     proved_key_value,
@@ -2909,14 +3045,7 @@ impl GroveDb {
         // child hash is NULL_HASH, or
         // EMPTY_COMMITMENT_TREE_STATE_ROOT for a
         // CommitmentTree.
-        let requires_child_hash = element.is_non_empty_merk_tree()
-            || (grove_version
-                .grovedb_versions
-                .operations
-                .proof
-                .terminal_non_merk_tree_child_hash
-                >= 1
-                && element.is_non_empty_tree());
+        let requires_child_hash = terminal_requires_child_hash(element, grove_version);
         if requires_child_hash && !proved_key_value.child_hash_verified {
             return Err(invalid_proof(
                 query,
