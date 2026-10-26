@@ -293,3 +293,88 @@ fn display_prints_the_instance_limit() {
     let plain = format!("{}", Query::new_range_full());
     assert!(!plain.contains("limit:"), "got: {plain}");
 }
+
+/// The walk as it was written before the two walkers became explicit
+/// recursive functions: one walker parameterised by a predicate, recursing
+/// through a closure. Kept here as the reference the walkers must match.
+fn reference_any_instance_limit(query: &Query, predicate: fn(Option<u16>) -> bool) -> bool {
+    let branch_matches = |branch: &SubqueryBranch| {
+        branch
+            .subquery
+            .as_deref()
+            .is_some_and(|subquery| reference_any_instance_limit(subquery, predicate))
+    };
+    predicate(query.limit)
+        || branch_matches(&query.default_subquery_branch)
+        || query
+            .conditional_subquery_branches
+            .as_ref()
+            .is_some_and(|branches| branches.values().any(branch_matches))
+}
+
+fn with_limit(limit: Option<u16>) -> Query {
+    let mut query = Query::new_range_full();
+    query.limit = limit;
+    query
+}
+
+/// Every query built from `limit`, an optional default subquery from
+/// `children`, and zero, one or two conditional branches (subquery-less,
+/// or with a subquery from `children`).
+fn query_trees(children: &[Query], with_pairs: bool) -> Vec<Query> {
+    let mut out = Vec::new();
+    for limit in [None, Some(0), Some(1)] {
+        let defaults = std::iter::once(None).chain(children.iter().cloned().map(Some));
+        for default in defaults {
+            let mut conditionals: Vec<Vec<Option<Query>>> = vec![vec![], vec![None]];
+            for child in children {
+                conditionals.push(vec![Some(child.clone())]);
+                if with_pairs {
+                    for second in children {
+                        conditionals.push(vec![Some(child.clone()), Some(second.clone())]);
+                    }
+                }
+            }
+            for branches in &conditionals {
+                let mut query = with_limit(limit);
+                if let Some(default) = &default {
+                    query.set_subquery(default.clone());
+                }
+                for (n, sub) in branches.iter().enumerate() {
+                    query.add_conditional_subquery(
+                        QueryItem::Key(vec![n as u8]),
+                        None,
+                        sub.clone(),
+                    );
+                }
+                out.push(query);
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn instance_limit_walkers_match_the_predicate_walk() {
+    let leaves: Vec<Query> = [None, Some(0), Some(1)]
+        .into_iter()
+        .map(with_limit)
+        .collect();
+    let depth_one = query_trees(&leaves, true);
+    let depth_two = query_trees(&depth_one, false);
+    let mut checked = 0;
+    for query in leaves.iter().chain(&depth_one).chain(&depth_two) {
+        assert_eq!(
+            query.has_instance_limit_anywhere(),
+            reference_any_instance_limit(query, |limit| limit.is_some()),
+            "{query}"
+        );
+        assert_eq!(
+            query.has_zero_instance_limit_anywhere(),
+            reference_any_instance_limit(query, |limit| limit == Some(0)),
+            "{query}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 1000, "only {checked} query trees checked");
+}

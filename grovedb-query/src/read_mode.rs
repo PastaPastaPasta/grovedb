@@ -216,12 +216,17 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            for branch in branches.values() {
+            let mut i = 0;
+            while i < branches.len() {
+                let Some((_, branch)) = branches.get_index(i) else {
+                    break;
+                };
                 if let Some(sub) = branch.subquery.as_deref()
                     && sub.has_read_mode_anywhere()
                 {
                     return true;
                 }
+                i += 1;
             }
         }
         false

@@ -1218,7 +1218,12 @@ impl PathQuery {
             let path_after_top_removed = &path[1..];
 
             if let Some(conditional_branches) = &query.conditional_subquery_branches {
-                for (query_item, subquery_branch) in conditional_branches {
+                let mut i = 0;
+                while i < conditional_branches.len() {
+                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
+                    else {
+                        break;
+                    };
                     if query_item.contains(key) {
                         if let Some(subquery_path) = &subquery_branch.subquery_path {
                             if path_after_top_removed.len() <= subquery_path.len() {
@@ -1248,6 +1253,7 @@ impl PathQuery {
 
                         return false;
                     }
+                    i += 1;
                 }
             }
 
@@ -1356,10 +1362,16 @@ impl PathQuery {
             let rest = &path[1..];
 
             if let Some(conditional_branches) = &query.conditional_subquery_branches {
-                for (query_item, subquery_branch) in conditional_branches {
+                let mut i = 0;
+                while i < conditional_branches.len() {
+                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
+                    else {
+                        break;
+                    };
                     if query_item.contains(key) {
                         return resolve_branch_at_path(subquery_branch, rest);
                     }
+                    i += 1;
                 }
             }
             resolve_branch_at_path(&query.default_subquery_branch, rest)
@@ -1428,7 +1440,12 @@ impl PathQuery {
             let path_after_top_removed = &path[1..];
 
             if let Some(conditional_branches) = &query.conditional_subquery_branches {
-                for (query_item, subquery_branch) in conditional_branches {
+                let mut i = 0;
+                while i < conditional_branches.len() {
+                    let Some((query_item, subquery_branch)) = conditional_branches.get_index(i)
+                    else {
+                        break;
+                    };
                     if query_item.contains(key) {
                         if let Some(subquery_path) = &subquery_branch.subquery_path {
                             if path_after_top_removed.len() <= subquery_path.len() {
@@ -1461,6 +1478,7 @@ impl PathQuery {
 
                         return None;
                     }
+                    i += 1;
                 }
             }
 
@@ -1564,9 +1582,19 @@ impl HasSubquery<'_> {
     pub fn has_subquery_on_key(&self, key: &[u8]) -> bool {
         match self {
             HasSubquery::NoSubquery => false,
-            HasSubquery::Conditionally(conditionally) => conditionally
-                .keys()
-                .any(|query_item| query_item.contains(key)),
+            HasSubquery::Conditionally(conditionally) => {
+                let mut i = 0;
+                while i < conditionally.len() {
+                    let Some((query_item, _)) = conditionally.get_index(i) else {
+                        break;
+                    };
+                    if query_item.contains(key) {
+                        return true;
+                    }
+                    i += 1;
+                }
+                false
+            }
             HasSubquery::Always => true,
         }
     }

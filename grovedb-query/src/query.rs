@@ -381,29 +381,58 @@ impl Query {
     /// fail closed instead of silently running the query with the caps
     /// ignored.
     pub fn has_instance_limit_anywhere(&self) -> bool {
-        self.any_instance_limit(|limit| limit.is_some())
+        if self.limit.is_some() {
+            return true;
+        }
+        if let Some(sub) = self.default_subquery_branch.subquery.as_deref()
+            && sub.has_instance_limit_anywhere()
+        {
+            return true;
+        }
+        if let Some(branches) = &self.conditional_subquery_branches {
+            let mut i = 0;
+            while i < branches.len() {
+                let Some((_, branch)) = branches.get_index(i) else {
+                    break;
+                };
+                if let Some(sub) = branch.subquery.as_deref()
+                    && sub.has_instance_limit_anywhere()
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
     }
 
     /// Whether any per-instance limit in this query tree is `Some(0)`.
     /// A node that may select nothing is a malformed query, not an
     /// empty result; serving entry points reject it.
     pub fn has_zero_instance_limit_anywhere(&self) -> bool {
-        self.any_instance_limit(|limit| limit == Some(0))
-    }
-
-    fn any_instance_limit(&self, predicate: fn(Option<u16>) -> bool) -> bool {
-        let branch_matches = |branch: &SubqueryBranch| {
-            branch
-                .subquery
-                .as_deref()
-                .is_some_and(|subquery| subquery.any_instance_limit(predicate))
-        };
-        predicate(self.limit)
-            || branch_matches(&self.default_subquery_branch)
-            || self
-                .conditional_subquery_branches
-                .as_ref()
-                .is_some_and(|branches| branches.values().any(branch_matches))
+        if self.limit == Some(0) {
+            return true;
+        }
+        if let Some(sub) = self.default_subquery_branch.subquery.as_deref()
+            && sub.has_zero_instance_limit_anywhere()
+        {
+            return true;
+        }
+        if let Some(branches) = &self.conditional_subquery_branches {
+            let mut i = 0;
+            while i < branches.len() {
+                let Some((_, branch)) = branches.get_index(i) else {
+                    break;
+                };
+                if let Some(sub) = branch.subquery.as_deref()
+                    && sub.has_zero_instance_limit_anywhere()
+                {
+                    return true;
+                }
+                i += 1;
+            }
+        }
+        false
     }
 }
 
