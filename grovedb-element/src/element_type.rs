@@ -459,7 +459,7 @@ impl ElementType {
             // Use an explicit allowlist so the next base-variant addition
             // is a one-line edit here and the check stays robust to new
             // variants landing without updating the guard.
-            if !matches!(inner_byte, 0..=14 | 18 | 19 | 20 | 21 | 22 | 23 | 24) {
+            if !is_base_discriminant(inner_byte) {
                 return Err(ElementError::CorruptedData(format!(
                     "NonCounted inner discriminant must be a base type \
                      (0..=14, 18, 19, 20, 21, 22, 23, or 24), got {}",
@@ -2488,4 +2488,14 @@ mod tests {
             );
         }
     }
+}
+
+/// A legal base-type discriminant inside a counting/summing wrapper: `0..=14`
+/// or `18..=24` (see `ElementType::from_serialized_value`).
+///
+/// Spelled out as comparisons (not a range pattern or `RangeInclusive::contains`)
+/// so the formal-verification toolchain can translate it.
+#[allow(clippy::manual_range_contains)]
+const fn is_base_discriminant(b: u8) -> bool {
+    b <= 14 || (b >= 18 && b <= 24)
 }

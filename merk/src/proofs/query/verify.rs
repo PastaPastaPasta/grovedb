@@ -2,6 +2,7 @@ use std::fmt;
 
 use grovedb_costs::{cost_return_on_error, CostResult, CostsExt, OperationCost};
 use grovedb_element::ElementType;
+use grovedb_query::QueryItem;
 
 #[cfg(feature = "minimal")]
 use crate::proofs::query::{Map, MapBuilder};
@@ -221,15 +222,20 @@ impl QueryProofVerify for Query {
         }
         let mut cost = OperationCost::default();
 
-        let mut output = Vec::with_capacity(self.len());
-        let mut last_push = None;
-        let mut query = self.directional_iter(left_to_right).peekable();
-        let mut in_range = false;
-        let original_limit = limit;
-        let mut current_limit = limit;
-        // Upper-bound mode only: set where the proof stops revealing the
-        // query, which is where the prover stopped walking.
-        let mut stopped_early = false;
+        let mut walk = QueryWalk {
+            left_to_right,
+            consumed: 0,
+            in_range: false,
+            last_push: None,
+            original_limit: limit,
+            current_limit: limit,
+            // Upper-bound mode only: set where the proof stops revealing the
+            // query, which is where the prover stopped walking.
+            stopped_early: false,
+            limit_mode,
+            proof_version,
+            output: Vec::with_capacity(self.len()),
+        };
 
         let mut decoder = Decoder::new(bytes);
 
@@ -255,596 +261,13 @@ impl QueryProofVerify for Query {
         // Enforced for V1 proofs only: V0 is a locked wire format whose
         // verifier is not to change, and it is gated at `proof_version`
         // like the other V1-only strictness checks in this function.
-        let oriented_ops = decoder.by_ref().map(|op_result| {
-            let op = op_result?;
-            if proof_version >= 1 && op_is_upright(&op) != left_to_right {
-                return Err(Error::InvalidProofError(format!(
-                    "Proof op family does not match the query direction: {} op in a {} walk; a \
-                     layer proof is emitted entirely in the family of its own direction",
-                    if op_is_upright(&op) {
-                        "upright"
-                    } else {
-                        "inverted"
-                    },
-                    if left_to_right {
-                        "left-to-right"
-                    } else {
-                        "right-to-left"
-                    },
-                )));
-            }
-            Ok(op)
-        });
+        let oriented_ops = OrientedOps {
+            decoder: &mut decoder,
+            proof_version,
+            left_to_right,
+        };
 
-        let root_wrapped = execute(oriented_ops, true, |node| {
-            let mut execute_node = |key: &Vec<u8>,
-                                    value: Option<&Vec<u8>>,
-                                    value_hash: CryptoHash,
-                                    child_hash_verified: bool,
-                                    plain_trusted_value: bool|
-             -> Result<_, Error> {
-                // Upper-bound mode: once the walk has stopped, a V1 prover
-                // reveals no further key (see `ProofLimitMode::UpperBound`).
-                // A key here would be a result, or a bound for one, after a
-                // gap the verifier cannot see.
-                if stopped_early {
-                    return Err(Error::InvalidProofError(
-                        "Proof reveals a key after the walk stopped".to_string(),
-                    ));
-                }
-                while let Some(item) = query.peek() {
-                    // get next item in query
-                    let query_item = *item;
-                    let (lower_bound, start_non_inclusive) = query_item.lower_bound();
-                    let (upper_bound, end_inclusive) = query_item.upper_bound();
-
-                    // terminate if we encounter a node before the current query item.
-                    // this means a node less than the current query item for left to right.
-                    // and a node greater than the current query item for right to left.
-                    let terminate = if left_to_right {
-                        // if the query item is lower unbounded, then a node cannot be less than it.
-                        // checks that the lower bound of the query item not greater than the key
-                        // if they are equal make sure the start is inclusive
-                        !query_item.lower_unbounded()
-                            && ((lower_bound.expect("confirmed not unbounded") > key.as_slice())
-                                || (start_non_inclusive
-                                    && lower_bound.expect("confirmed not unbounded")
-                                        == key.as_slice()))
-                    } else {
-                        !query_item.upper_unbounded()
-                            && ((upper_bound.expect("confirmed not unbounded") < key.as_slice())
-                                || (!end_inclusive
-                                    && upper_bound.expect("confirmed not unbounded")
-                                        == key.as_slice()))
-                    };
-                    if terminate {
-                        break;
-                    }
-
-                    if !in_range {
-                        // this is the first data we have encountered for this query item
-                        if left_to_right {
-                            // ensure lower bound of query item is proven
-                            match last_push {
-                                // lower bound is proven - we have an exact match
-                                // ignoring the case when the lower bound is unbounded
-                                // as it's not possible the get an exact key match for
-                                // an unbounded value
-                                _ if Some(key.as_slice()) == query_item.lower_bound().0 => {}
-
-                                // lower bound is proven - this is the leftmost node
-                                // in the tree
-                                None => {}
-
-                                // lower bound is proven - the preceding tree node
-                                // is lower than the bound
-                                Some(Node::KV(..)) => {}
-                                Some(Node::KVDigest(..)) => {}
-                                Some(Node::KVDigestCount(..)) => {}
-                                Some(Node::KVDigestSum(..)) => {}
-                                Some(Node::KVRefValueHash(..)) => {}
-                                Some(Node::KVValueHash(..)) => {}
-                                Some(Node::KVBackwardsReferencesValueHash(..)) => {}
-                                Some(Node::KVValueHashFeatureType(..)) => {}
-                                Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
-                                Some(Node::KVRefValueHashCount(..)) => {}
-                                Some(Node::KVRefValueHashSum(..)) => {}
-                                Some(Node::KVCount(..)) => {}
-                                Some(Node::KVSum(..)) => {}
-                                // ProvableCountProvableSumTree (dual-axis)
-                                // key-bearing nodes are also acceptable
-                                // bound-proving boundaries.
-                                Some(Node::KVCountSum(..)) => {}
-                                Some(Node::KVDigestCountSum(..)) => {}
-                                Some(Node::KVRefValueHashCountSum(..)) => {}
-
-                                // cannot verify lower bound - we have an abridged
-                                // tree, so we cannot tell what the preceding key was
-                                Some(_) => {
-                                    return Err(Error::InvalidProofError(
-                                        "Cannot verify lower bound of queried range".to_string(),
-                                    ));
-                                }
-                            }
-                        } else {
-                            // ensure upper bound of query item is proven
-                            match last_push {
-                                // upper bound is proven - we have an exact match
-                                // ignoring the case when the upper bound is unbounded
-                                // as it's not possible the get an exact key match for
-                                // an unbounded value
-                                _ if Some(key.as_slice()) == query_item.upper_bound().0 => {}
-
-                                // lower bound is proven - this is the rightmost node
-                                // in the tree
-                                None => {}
-
-                                // upper bound is proven - the preceding tree node
-                                // is greater than the bound
-                                Some(Node::KV(..)) => {}
-                                Some(Node::KVDigest(..)) => {}
-                                Some(Node::KVDigestCount(..)) => {}
-                                Some(Node::KVDigestSum(..)) => {}
-                                Some(Node::KVRefValueHash(..)) => {}
-                                Some(Node::KVValueHash(..)) => {}
-                                Some(Node::KVBackwardsReferencesValueHash(..)) => {}
-                                Some(Node::KVValueHashFeatureType(..)) => {}
-                                Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
-                                Some(Node::KVRefValueHashCount(..)) => {}
-                                Some(Node::KVRefValueHashSum(..)) => {}
-                                Some(Node::KVCount(..)) => {}
-                                Some(Node::KVSum(..)) => {}
-                                // ProvableCountProvableSumTree (dual-axis)
-                                // key-bearing nodes are also acceptable
-                                // upper-bound-proving boundaries.
-                                Some(Node::KVCountSum(..)) => {}
-                                Some(Node::KVDigestCountSum(..)) => {}
-                                Some(Node::KVRefValueHashCountSum(..)) => {}
-
-                                // cannot verify upper bound - we have an abridged
-                                // tree so we cannot tell what the previous key was
-                                Some(_) => {
-                                    return Err(Error::InvalidProofError(
-                                        "Cannot verify upper bound of queried range".to_string(),
-                                    ));
-                                }
-                            }
-                        }
-                    }
-
-                    if left_to_right {
-                        if query_item.upper_bound().0.is_some()
-                            && Some(key.as_slice()) >= query_item.upper_bound().0
-                        {
-                            // at or past upper bound of range (or this was an exact
-                            // match on a single-key queryitem), advance to next query
-                            // item
-                            query.next();
-                            in_range = false;
-                        } else {
-                            // have not reached upper bound, we expect more values
-                            // to be proven in the range (and all pushes should be
-                            // unabridged until we reach end of range)
-                            in_range = true;
-                        }
-                    } else if query_item.lower_bound().0.is_some()
-                        && Some(key.as_slice()) <= query_item.lower_bound().0
-                    {
-                        // at or before lower bound of range (or this was an exact
-                        // match on a single-key queryitem), advance to next query
-                        // item
-                        query.next();
-                        in_range = false;
-                    } else {
-                        // have not reached lower bound, we expect more values
-                        // to be proven in the range (and all pushes should be
-                        // unabridged until we reach end of range)
-                        in_range = true;
-                    }
-
-                    // this push matches the queried item
-                    if query_item.contains(key) {
-                        if let Some(val) = value {
-                            // Terminal downgrade guard (V1 strict): the V4
-                            // prover rewrites every bidirectional-reference
-                            // node — result or filler — into a
-                            // KVRefValueHash* node whose target bytes are
-                            // bound by recomputation. One arriving as a plain
-                            // trusted-value result is therefore a
-                            // downgraded/forged node whose bytes ride unbound
-                            // on the carried hash. (Plain references can
-                            // legitimately appear raw in mixed-level V1
-                            // proofs and keep their long-standing handling.)
-                            if plain_trusted_value
-                                && proof_version >= 1
-                                && matches!(
-                                    ElementType::from_serialized_value(val).map(|et| et.base()),
-                                    Ok(ElementType::BidirectionalReference)
-                                )
-                            {
-                                return Err(Error::InvalidProofError(
-                                    "bidirectional-reference elements must be dereferenced \
-                                     into KVRefValueHash-family nodes in proof results"
-                                        .to_string(),
-                                ));
-                            }
-                            if let Some(limit) = current_limit {
-                                if limit == 0 {
-                                    return Err(Error::InvalidProofError(format!(
-                                        "Proof returns more data than limit {:?}",
-                                        original_limit
-                                    )));
-                                } else {
-                                    current_limit = Some(limit - 1);
-                                    if current_limit == Some(0) {
-                                        in_range = false;
-                                    }
-                                }
-                            }
-                            #[cfg(feature = "proof_debug")]
-                            {
-                                println!(
-                                    "pushing {}",
-                                    ProvedKeyOptionalValue {
-                                        key: key.clone(),
-                                        value: Some(val.clone()),
-                                        proof: value_hash,
-                                        child_hash_verified,
-                                    }
-                                );
-                            }
-                            // add data to output
-                            output.push(ProvedKeyOptionalValue {
-                                key: key.clone(),
-                                value: Some(val.clone()),
-                                proof: value_hash,
-                                child_hash_verified,
-                            });
-
-                            // continue to next push
-                            break;
-                        } else {
-                            return Err(Error::InvalidProofError(
-                                "Proof is missing data for query".to_string(),
-                            ));
-                        }
-                    }
-                    {}
-                    // continue to next queried item
-                }
-                Ok(())
-            };
-
-            match node {
-                Node::KV(key, value) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KV node");
-                    }
-                    execute_node(key, Some(value), value_hash(value).unwrap(), false, false)?;
-                }
-                Node::KVValueHash(key, value, value_hash) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVValueHash node");
-                    }
-                    // KVValueHash exists for elements whose value_hash is a
-                    // combine_hash (subtrees and references). Reject item
-                    // elements to prevent KV→KVValueHash forgery where an
-                    // attacker substitutes a KV node with KVValueHash to inject
-                    // a fake value while keeping the original hash.
-                    // Skipped for V0 backwards compatibility.
-                    //
-                    // Reference elements deliberately PASS here even though
-                    // this node hashes only (key, value_hash) and so binds
-                    // none of their bytes. A reference row that lies past
-                    // the query limit legitimately stays a bare KVValueHash
-                    // in released V1 proofs — the GroveDB post-pass only
-                    // rewrites rows within the limit into KVRefValueHash* —
-                    // so refusing references at this level would reject
-                    // honest proofs. The binding contract for reference
-                    // bytes is enforced by the only consumer of these rows:
-                    // `verify_layer_proof_v1` rejects any raw reference row
-                    // it consumes (issue #862).
-                    if proof_version >= 1 {
-                        let element_type =
-                            ElementType::from_serialized_value(value).map_err(|e| {
-                                Error::InvalidProofError(format!(
-                                    "cannot determine element type in KVValueHash node: {e}"
-                                ))
-                            })?;
-                        if element_type.has_simple_value_hash() {
-                            return Err(Error::InvalidProofError(
-                                "KVValueHash node must not contain an item element".to_string(),
-                            ));
-                        }
-                        // Backward-references elements must come through
-                        // KVBackwardsReferencesValueHash, whose combined
-                        // hash is RECOMPUTED — as a KVValueHash the value
-                        // bytes would ride unbound on the carried hash.
-                        if matches!(
-                            element_type.base(),
-                            ElementType::ItemWithBackwardsReferences
-                                | ElementType::SumItemWithBackwardsReferences
-                                | ElementType::ItemWithSumItemWithBackwardsReferences
-                        ) {
-                            return Err(Error::InvalidProofError(
-                                "KVValueHash node must not contain a backward-references \
-                                 element; use KVBackwardsReferencesValueHash"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    execute_node(key, Some(value), *value_hash, false, true)?;
-                }
-                Node::KVDigest(key, value_hash) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVDigest node");
-                    }
-                    execute_node(key, None, *value_hash, false, false)?;
-                }
-                Node::KVDigestCount(key, value_hash, _count) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVDigestCount node");
-                    }
-                    execute_node(key, None, *value_hash, false, false)?;
-                }
-                Node::KVRefValueHash(key, value, value_hash) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVRefValueHash node");
-                    }
-                    execute_node(key, Some(value), *value_hash, false, false)?;
-                }
-                Node::KVBackwardsReferencesValueHash(key, value, backrefs_hash) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVBackwardsReferencesValueHash node");
-                    }
-                    // The node kind was introduced with GROVE_V4 / V1
-                    // envelopes; a V0 proof carrying it would be accepted
-                    // here but rejected by every released verifier.
-                    if proof_version == 0 {
-                        return Err(Error::InvalidProofError(
-                            "KVBackwardsReferencesValueHash nodes are not allowed in V0 proofs"
-                                .to_string(),
-                        ));
-                    }
-                    // The node's combined hash is recomputed from the
-                    // stripped payload bytes it carries, so the bytes are
-                    // bound; the result set receives the stripped element.
-                    // The row is reported as hash-bound (`combine_hash(H(value),
-                    // backrefs_hash) == value_hash` was checked end to end),
-                    // the same evidence a child-hash node yields — readers that
-                    // classify rows from their bytes may trust these bytes.
-                    let combined = value_hash(value)
-                        .unwrap()
-                        .wrap_with_cost(Default::default())
-                        .flat_map(|inner| crate::tree::hash::combine_hash(&inner, backrefs_hash))
-                        .unwrap();
-                    execute_node(key, Some(value), combined, true, false)?;
-                }
-                Node::KVCount(key, value, _count) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVCount node");
-                    }
-                    execute_node(key, Some(value), value_hash(value).unwrap(), false, false)?;
-                }
-                Node::KVValueHashFeatureType(key, value, value_hash, _feature_type) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVValueHashFeatureType node");
-                    }
-                    // Same check as KVValueHash — reject item elements.
-                    // References pass here for the same reason as on
-                    // KVValueHash (beyond-limit reference rows stay bare in
-                    // released proofs); `verify_layer_proof_v1` refuses any
-                    // raw reference row it consumes.
-                    // Skipped for V0 backwards compatibility.
-                    if proof_version >= 1 {
-                        let element_type =
-                            ElementType::from_serialized_value(value).map_err(|e| {
-                                Error::InvalidProofError(format!(
-                                    "cannot determine element type in KVValueHashFeatureType \
-                                     node: {e}"
-                                ))
-                            })?;
-                        if element_type.has_simple_value_hash() {
-                            return Err(Error::InvalidProofError(
-                                "KVValueHashFeatureType node must not contain an item element"
-                                    .to_string(),
-                            ));
-                        }
-                        // Same rationale as the KVValueHash guard above.
-                        if matches!(
-                            element_type.base(),
-                            ElementType::ItemWithBackwardsReferences
-                                | ElementType::SumItemWithBackwardsReferences
-                                | ElementType::ItemWithSumItemWithBackwardsReferences
-                        ) {
-                            return Err(Error::InvalidProofError(
-                                "KVValueHashFeatureType node must not contain a \
-                                 backward-references element"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    execute_node(key, Some(value), *value_hash, false, true)?;
-                }
-                Node::KVRefValueHashCount(key, value, value_hash, _count) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVRefValueHashCount node");
-                    }
-                    execute_node(key, Some(value), *value_hash, false, false)?;
-                }
-                Node::KVValueHashFeatureTypeWithChildHash(
-                    key,
-                    value,
-                    node_value_hash,
-                    _feature_type,
-                    child_hash,
-                ) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVValueHashFeatureTypeWithChildHash node");
-                    }
-                    // Same element-type check as KVValueHashFeatureType.
-                    // Skipped for V0 backwards compatibility.
-                    if proof_version >= 1 {
-                        let element_type =
-                            ElementType::from_serialized_value(value).map_err(|e| {
-                                Error::InvalidProofError(format!(
-                                    "cannot determine element type in \
-                                     KVValueHashFeatureTypeWithChildHash node: {e}"
-                                ))
-                            })?;
-                        if element_type.has_simple_value_hash() {
-                            return Err(Error::InvalidProofError(
-                                "KVValueHashFeatureTypeWithChildHash node must not contain \
-                                 an item element"
-                                    .to_string(),
-                            ));
-                        }
-                    }
-                    // Verify value integrity: combine_hash(H(value), child_hash) must
-                    // equal the provided value_hash. This prevents an attacker from
-                    // swapping the serialized element bytes (e.g. changing a CountTree's
-                    // count) while reusing the original value_hash.
-                    let element_value_hash = value_hash(value).unwrap();
-                    let computed_value_hash =
-                        combine_hash(&element_value_hash, child_hash).unwrap();
-                    if computed_value_hash != *node_value_hash {
-                        return Err(Error::InvalidProofError(format!(
-                            "value/child hash mismatch: combine_hash(H(value), child_hash) \
-                             = {} but value_hash = {}",
-                            hex::encode(computed_value_hash),
-                            hex::encode(node_value_hash)
-                        )));
-                    }
-                    execute_node(key, Some(value), *node_value_hash, true, false)?;
-                }
-                Node::Hash(_)
-                | Node::KVHash(_)
-                | Node::KVHashCount(..)
-                | Node::KVHashSum(..)
-                | Node::KVHashCountSum(..) => {
-                    if in_range {
-                        // `in_range` is only set by a node the current item
-                        // contains, which is a result, so `output` is never
-                        // empty here. The check keeps the "no stop before
-                        // the first result" rule explicit, as at the other
-                        // stopping point.
-                        if limit_mode == ProofLimitMode::UpperBound && !output.is_empty() {
-                            // The prover stopped here: it hides everything
-                            // after its last result once its own limit runs
-                            // out. Everything from this node on is
-                            // unrevealed, so the walk ends with the results
-                            // so far.
-                            in_range = false;
-                            stopped_early = true;
-                        } else {
-                            return Err(Error::InvalidProofError(format!(
-                                "Proof is missing data for query range. Encountered unexpected \
-                                 node type: {}",
-                                node
-                            )));
-                        }
-                    }
-                }
-                Node::HashWithCount(..) => {
-                    // `HashWithCount` is only safe inside the dedicated
-                    // aggregate-count verifier, which shape-checks each
-                    // collapsed subtree against the queried range. The plain
-                    // query verifier does no such shape check, and
-                    // `Tree::hash()` for a `HashWithCount` recomputes its
-                    // hash from the embedded `(kv_hash, l, r, count)` while
-                    // *ignoring* any reconstructed children. A malicious
-                    // prover could therefore hang fake KV pushes under a
-                    // `HashWithCount`, satisfy `execute_node` from those
-                    // pushes (so they appear as query results) while still
-                    // preserving the parent's hash chain. Fail fast here so
-                    // the regular query path can never accept one.
-                    return Err(Error::InvalidProofError(
-                        "HashWithCount node is only valid in aggregate-count proofs; \
-                         encountered in regular query verification"
-                            .to_string(),
-                    ));
-                }
-                Node::HashWithSum(..) => {
-                    // Same fail-fast rationale as `HashWithCount` above.
-                    // `HashWithSum` is reserved for the dedicated
-                    // aggregate-sum verifier; it must never reach the
-                    // regular query verifier.
-                    return Err(Error::InvalidProofError(
-                        "HashWithSum node is only valid in aggregate-sum proofs; \
-                         encountered in regular query verification"
-                            .to_string(),
-                    ));
-                }
-                Node::HashWithCountAndSum(..) => {
-                    // Same fail-fast rationale as `HashWithCount` /
-                    // `HashWithSum`. The combined variant is reserved for
-                    // the dedicated aggregate-count and aggregate-sum
-                    // verifiers against `ProvableCountProvableSumTree`;
-                    // it must never reach the regular query verifier.
-                    return Err(Error::InvalidProofError(
-                        "HashWithCountAndSum node is only valid in aggregate-count / \
-                         aggregate-sum proofs; encountered in regular query verification"
-                            .to_string(),
-                    ));
-                }
-                Node::KVSum(key, value, _sum) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVSum node");
-                    }
-                    execute_node(key, Some(value), value_hash(value).unwrap(), false, false)?;
-                }
-                Node::KVDigestSum(key, value_hash, _sum) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVDigestSum node");
-                    }
-                    execute_node(key, None, *value_hash, false, false)?;
-                }
-                Node::KVRefValueHashSum(key, value, value_hash, _sum) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVRefValueHashSum node");
-                    }
-                    execute_node(key, Some(value), *value_hash, false, false)?;
-                }
-                Node::KVCountSum(key, value, _count, _sum) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVCountSum node");
-                    }
-                    execute_node(key, Some(value), value_hash(value).unwrap(), false, false)?;
-                }
-                Node::KVDigestCountSum(key, value_hash, _count, _sum) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVDigestCountSum node");
-                    }
-                    execute_node(key, None, *value_hash, false, false)?;
-                }
-                Node::KVRefValueHashCountSum(key, value, value_hash, _count, _sum) => {
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!("Processing KVRefValueHashCountSum node");
-                    }
-                    execute_node(key, Some(value), *value_hash, false, false)?;
-                }
-            }
-
-            last_push = Some(node.clone());
-
-            Ok(())
-        });
+        let root_wrapped = execute(oriented_ops, true, |node| walk.visit(&self.items, node));
 
         let root = cost_return_on_error!(&mut cost, root_wrapped);
 
@@ -858,10 +281,10 @@ impl QueryProofVerify for Query {
 
         // we have remaining query items, check absence proof against right edge of
         // tree
-        if query.peek().is_some() {
-            if current_limit == Some(0) || stopped_early {
+        if walk.peek(&self.items).is_some() {
+            if walk.current_limit == Some(0) || walk.stopped_early {
             } else {
-                match last_push {
+                match walk.last_push {
                     // last node in tree was less than queried item
                     Some(Node::KV(..)) => {}
                     Some(Node::KVDigest(..)) => {}
@@ -886,8 +309,10 @@ impl QueryProofVerify for Query {
 
                     // Upper-bound mode: the prover stopped after the results so
                     // far and hid the rest; the remaining items are unproven.
-                    _ if limit_mode == ProofLimitMode::UpperBound && !output.is_empty() => {
-                        stopped_early = true;
+                    _ if walk.limit_mode == ProofLimitMode::UpperBound
+                        && !walk.output.is_empty() =>
+                    {
+                        walk.stopped_early = true;
                     }
 
                     // proof contains abridged data so we cannot verify absence of
@@ -906,13 +331,14 @@ impl QueryProofVerify for Query {
         // stopped (at the limit, or early in upper-bound mode) with query items
         // left. When items were left and it is true, the absence check above
         // proved them.
-        let exhausted = !stopped_early && (query.peek().is_none() || current_limit != Some(0));
+        let exhausted = !walk.stopped_early
+            && (walk.peek(&self.items).is_none() || walk.current_limit != Some(0));
 
         Ok((
             root.hash().unwrap_add_cost(&mut cost),
             ProofVerificationResult {
-                result_set: output,
-                limit: current_limit,
+                result_set: walk.output,
+                limit: walk.current_limit,
                 exhausted,
             },
         ))
@@ -940,6 +366,683 @@ impl QueryProofVerify for Query {
             })
             .flatten()
     }
+}
+
+/// Walk state of [`QueryProofVerify::execute_proof_with_limit_mode`].
+///
+/// The closure the verifier passes to [`execute`] is [`QueryWalk::visit`],
+/// and the checks after the proof is executed read the final state. Keeping
+/// the walk as plain methods over explicit state (rather than closures over
+/// locals and a boxed iterator) is what lets the formal-verification
+/// toolchain translate it; behaviour is unchanged.
+struct QueryWalk {
+    left_to_right: bool,
+    /// How many items have been consumed from the front of the walk order.
+    consumed: usize,
+    in_range: bool,
+    last_push: Option<Node>,
+    original_limit: Option<u16>,
+    current_limit: Option<u16>,
+    stopped_early: bool,
+    limit_mode: ProofLimitMode,
+    proof_version: u16,
+    output: Vec<ProvedKeyOptionalValue>,
+}
+
+impl QueryWalk {
+    /// The current query item in walk order (`directional_iter().peek()`).
+    /// `items` are the query's items in key order.
+    fn peek<'q>(&self, items: &'q [QueryItem]) -> Option<&'q QueryItem> {
+        if self.consumed >= items.len() {
+            None
+        } else if self.left_to_right {
+            Some(&items[self.consumed])
+        } else {
+            Some(&items[items.len() - 1 - self.consumed])
+        }
+    }
+
+    /// Move to the next query item (`directional_iter().next()`).
+    fn advance(&mut self) {
+        self.consumed += 1;
+    }
+
+    /// Match one key-bearing proof node against the query items.
+    fn visit_key(
+        &mut self,
+        items: &[QueryItem],
+        key: &Vec<u8>,
+        value: Option<&Vec<u8>>,
+        value_hash: CryptoHash,
+        child_hash_verified: bool,
+        plain_trusted_value: bool,
+    ) -> Result<(), Error> {
+        // Upper-bound mode: once the walk has stopped, a V1 prover
+        // reveals no further key (see `ProofLimitMode::UpperBound`).
+        // A key here would be a result, or a bound for one, after a
+        // gap the verifier cannot see.
+        if self.stopped_early {
+            return Err(Error::InvalidProofError(
+                "Proof reveals a key after the walk stopped".to_string(),
+            ));
+        }
+        while let Some(query_item) = self.peek(items) {
+            // get next item in query
+            // terminate if we encounter a node before the current query item.
+            // this means a node less than the current query item for left to right.
+            // and a node greater than the current query item for right to left.
+            let terminate = before_item(query_item, key.as_slice(), self.left_to_right);
+            if terminate {
+                break;
+            }
+
+            if !self.in_range {
+                // this is the first data we have encountered for this query item
+                if self.left_to_right {
+                    // ensure lower bound of query item is proven
+                    match self.last_push {
+                        // lower bound is proven - we have an exact match
+                        // ignoring the case when the lower bound is unbounded
+                        // as it's not possible the get an exact key match for
+                        // an unbounded value
+                        _ if Some(key.as_slice()) == query_item.lower_bound().0 => {}
+
+                        // lower bound is proven - this is the leftmost node
+                        // in the tree
+                        None => {}
+
+                        // lower bound is proven - the preceding tree node
+                        // is lower than the bound
+                        Some(Node::KV(..)) => {}
+                        Some(Node::KVDigest(..)) => {}
+                        Some(Node::KVDigestCount(..)) => {}
+                        Some(Node::KVDigestSum(..)) => {}
+                        Some(Node::KVRefValueHash(..)) => {}
+                        Some(Node::KVValueHash(..)) => {}
+                        Some(Node::KVBackwardsReferencesValueHash(..)) => {}
+                        Some(Node::KVValueHashFeatureType(..)) => {}
+                        Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
+                        Some(Node::KVRefValueHashCount(..)) => {}
+                        Some(Node::KVRefValueHashSum(..)) => {}
+                        Some(Node::KVCount(..)) => {}
+                        Some(Node::KVSum(..)) => {}
+                        // ProvableCountProvableSumTree (dual-axis)
+                        // key-bearing nodes are also acceptable
+                        // bound-proving boundaries.
+                        Some(Node::KVCountSum(..)) => {}
+                        Some(Node::KVDigestCountSum(..)) => {}
+                        Some(Node::KVRefValueHashCountSum(..)) => {}
+
+                        // cannot verify lower bound - we have an abridged
+                        // tree, so we cannot tell what the preceding key was
+                        Some(_) => {
+                            return Err(Error::InvalidProofError(
+                                "Cannot verify lower bound of queried range".to_string(),
+                            ));
+                        }
+                    }
+                } else {
+                    // ensure upper bound of query item is proven
+                    match self.last_push {
+                        // upper bound is proven - we have an exact match
+                        // ignoring the case when the upper bound is unbounded
+                        // as it's not possible the get an exact key match for
+                        // an unbounded value
+                        _ if Some(key.as_slice()) == query_item.upper_bound().0 => {}
+
+                        // lower bound is proven - this is the rightmost node
+                        // in the tree
+                        None => {}
+
+                        // upper bound is proven - the preceding tree node
+                        // is greater than the bound
+                        Some(Node::KV(..)) => {}
+                        Some(Node::KVDigest(..)) => {}
+                        Some(Node::KVDigestCount(..)) => {}
+                        Some(Node::KVDigestSum(..)) => {}
+                        Some(Node::KVRefValueHash(..)) => {}
+                        Some(Node::KVValueHash(..)) => {}
+                        Some(Node::KVBackwardsReferencesValueHash(..)) => {}
+                        Some(Node::KVValueHashFeatureType(..)) => {}
+                        Some(Node::KVValueHashFeatureTypeWithChildHash(..)) => {}
+                        Some(Node::KVRefValueHashCount(..)) => {}
+                        Some(Node::KVRefValueHashSum(..)) => {}
+                        Some(Node::KVCount(..)) => {}
+                        Some(Node::KVSum(..)) => {}
+                        // ProvableCountProvableSumTree (dual-axis)
+                        // key-bearing nodes are also acceptable
+                        // upper-bound-proving boundaries.
+                        Some(Node::KVCountSum(..)) => {}
+                        Some(Node::KVDigestCountSum(..)) => {}
+                        Some(Node::KVRefValueHashCountSum(..)) => {}
+
+                        // cannot verify upper bound - we have an abridged
+                        // tree so we cannot tell what the previous key was
+                        Some(_) => {
+                            return Err(Error::InvalidProofError(
+                                "Cannot verify upper bound of queried range".to_string(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            if past_item_end(query_item, key.as_slice(), self.left_to_right) {
+                // at or past the end of the range in walk order (or this was an
+                // exact match on a single-key queryitem), advance to next query
+                // item
+                self.advance();
+                self.in_range = false;
+            } else {
+                // have not reached the end of the range, we expect more values
+                // to be proven in the range (and all pushes should be
+                // unabridged until we reach end of range)
+                self.in_range = true;
+            }
+
+            // this push matches the queried item
+            if query_item.contains(key) {
+                if let Some(val) = value {
+                    // Terminal downgrade guard (V1 strict): the V4
+                    // prover rewrites every bidirectional-reference
+                    // node — result or filler — into a
+                    // KVRefValueHash* node whose target bytes are
+                    // bound by recomputation. One arriving as a plain
+                    // trusted-value result is therefore a
+                    // downgraded/forged node whose bytes ride unbound
+                    // on the carried hash. (Plain references can
+                    // legitimately appear raw in mixed-level V1
+                    // proofs and keep their long-standing handling.)
+                    if plain_trusted_value
+                        && self.proof_version >= 1
+                        && matches!(
+                            ElementType::from_serialized_value(val).map(|et| et.base()),
+                            Ok(ElementType::BidirectionalReference)
+                        )
+                    {
+                        return Err(Error::InvalidProofError(
+                            "bidirectional-reference elements must be dereferenced \
+                             into KVRefValueHash-family nodes in proof results"
+                                .to_string(),
+                        ));
+                    }
+                    if let Some(limit) = self.current_limit {
+                        if limit == 0 {
+                            return Err(Error::InvalidProofError(format!(
+                                "Proof returns more data than limit {:?}",
+                                self.original_limit
+                            )));
+                        } else {
+                            self.current_limit = Some(limit - 1);
+                            if self.current_limit == Some(0) {
+                                self.in_range = false;
+                            }
+                        }
+                    }
+                    #[cfg(feature = "proof_debug")]
+                    {
+                        println!(
+                            "pushing {}",
+                            ProvedKeyOptionalValue {
+                                key: key.clone(),
+                                value: Some(val.clone()),
+                                proof: value_hash,
+                                child_hash_verified,
+                            }
+                        );
+                    }
+                    // add data to self.output
+                    self.output.push(ProvedKeyOptionalValue {
+                        key: key.clone(),
+                        value: Some(val.clone()),
+                        proof: value_hash,
+                        child_hash_verified,
+                    });
+
+                    // continue to next push
+                    break;
+                } else {
+                    return Err(Error::InvalidProofError(
+                        "Proof is missing data for query".to_string(),
+                    ));
+                }
+            }
+            {}
+            // continue to next queried item
+        }
+        Ok(())
+    }
+
+    /// Visit one pushed proof node, in push order.
+    fn visit(&mut self, items: &[QueryItem], node: &Node) -> Result<(), Error> {
+        match node {
+            Node::KV(key, value) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KV node");
+                }
+                self.visit_key(
+                    items,
+                    key,
+                    Some(value),
+                    value_hash(value).unwrap(),
+                    false,
+                    false,
+                )?;
+            }
+            Node::KVValueHash(key, value, value_hash) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVValueHash node");
+                }
+                // KVValueHash exists for elements whose value_hash is a
+                // combine_hash (subtrees and references). Reject item
+                // elements to prevent KV→KVValueHash forgery where an
+                // attacker substitutes a KV node with KVValueHash to inject
+                // a fake value while keeping the original hash.
+                // Skipped for V0 backwards compatibility.
+                //
+                // Reference elements deliberately PASS here even though
+                // this node hashes only (key, value_hash) and so binds
+                // none of their bytes. A reference row that lies past
+                // the query limit legitimately stays a bare KVValueHash
+                // in released V1 proofs — the GroveDB post-pass only
+                // rewrites rows within the limit into KVRefValueHash* —
+                // so refusing references at this level would reject
+                // honest proofs. The binding contract for reference
+                // bytes is enforced by the only consumer of these rows:
+                // `verify_layer_proof_v1` rejects any raw reference row
+                // it consumes (issue #862).
+                if self.proof_version >= 1 {
+                    let element_type = ElementType::from_serialized_value(value).map_err(|e| {
+                        Error::InvalidProofError(format!(
+                            "cannot determine element type in KVValueHash node: {e}"
+                        ))
+                    })?;
+                    if element_type.has_simple_value_hash() {
+                        return Err(Error::InvalidProofError(
+                            "KVValueHash node must not contain an item element".to_string(),
+                        ));
+                    }
+                    // Backward-references elements must come through
+                    // KVBackwardsReferencesValueHash, whose combined
+                    // hash is RECOMPUTED — as a KVValueHash the value
+                    // bytes would ride unbound on the carried hash.
+                    if matches!(
+                        element_type.base(),
+                        ElementType::ItemWithBackwardsReferences
+                            | ElementType::SumItemWithBackwardsReferences
+                            | ElementType::ItemWithSumItemWithBackwardsReferences
+                    ) {
+                        return Err(Error::InvalidProofError(
+                            "KVValueHash node must not contain a backward-references \
+                             element; use KVBackwardsReferencesValueHash"
+                                .to_string(),
+                        ));
+                    }
+                }
+                self.visit_key(items, key, Some(value), *value_hash, false, true)?;
+            }
+            Node::KVDigest(key, value_hash) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVDigest node");
+                }
+                self.visit_key(items, key, None, *value_hash, false, false)?;
+            }
+            Node::KVDigestCount(key, value_hash, _count) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVDigestCount node");
+                }
+                self.visit_key(items, key, None, *value_hash, false, false)?;
+            }
+            Node::KVRefValueHash(key, value, value_hash) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVRefValueHash node");
+                }
+                self.visit_key(items, key, Some(value), *value_hash, false, false)?;
+            }
+            Node::KVBackwardsReferencesValueHash(key, value, backrefs_hash) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVBackwardsReferencesValueHash node");
+                }
+                // The node kind was introduced with GROVE_V4 / V1
+                // envelopes; a V0 proof carrying it would be accepted
+                // here but rejected by every released verifier.
+                if self.proof_version == 0 {
+                    return Err(Error::InvalidProofError(
+                        "KVBackwardsReferencesValueHash nodes are not allowed in V0 proofs"
+                            .to_string(),
+                    ));
+                }
+                // The node's combined hash is recomputed from the
+                // stripped payload bytes it carries, so the bytes are
+                // bound; the result set receives the stripped element.
+                // The row is reported as hash-bound (`combine_hash(H(value),
+                // backrefs_hash) == value_hash` was checked end to end),
+                // the same evidence a child-hash node yields — readers that
+                // classify rows from their bytes may trust these bytes.
+                let combined = value_hash(value)
+                    .unwrap()
+                    .wrap_with_cost(Default::default())
+                    .flat_map(|inner| crate::tree::hash::combine_hash(&inner, backrefs_hash))
+                    .unwrap();
+                self.visit_key(items, key, Some(value), combined, true, false)?;
+            }
+            Node::KVCount(key, value, _count) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVCount node");
+                }
+                self.visit_key(
+                    items,
+                    key,
+                    Some(value),
+                    value_hash(value).unwrap(),
+                    false,
+                    false,
+                )?;
+            }
+            Node::KVValueHashFeatureType(key, value, value_hash, _feature_type) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVValueHashFeatureType node");
+                }
+                // Same check as KVValueHash — reject item elements.
+                // References pass here for the same reason as on
+                // KVValueHash (beyond-limit reference rows stay bare in
+                // released proofs); `verify_layer_proof_v1` refuses any
+                // raw reference row it consumes.
+                // Skipped for V0 backwards compatibility.
+                if self.proof_version >= 1 {
+                    let element_type = ElementType::from_serialized_value(value).map_err(|e| {
+                        Error::InvalidProofError(format!(
+                            "cannot determine element type in KVValueHashFeatureType \
+                                 node: {e}"
+                        ))
+                    })?;
+                    if element_type.has_simple_value_hash() {
+                        return Err(Error::InvalidProofError(
+                            "KVValueHashFeatureType node must not contain an item element"
+                                .to_string(),
+                        ));
+                    }
+                    // Same rationale as the KVValueHash guard above.
+                    if matches!(
+                        element_type.base(),
+                        ElementType::ItemWithBackwardsReferences
+                            | ElementType::SumItemWithBackwardsReferences
+                            | ElementType::ItemWithSumItemWithBackwardsReferences
+                    ) {
+                        return Err(Error::InvalidProofError(
+                            "KVValueHashFeatureType node must not contain a \
+                             backward-references element"
+                                .to_string(),
+                        ));
+                    }
+                }
+                self.visit_key(items, key, Some(value), *value_hash, false, true)?;
+            }
+            Node::KVRefValueHashCount(key, value, value_hash, _count) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVRefValueHashCount node");
+                }
+                self.visit_key(items, key, Some(value), *value_hash, false, false)?;
+            }
+            Node::KVValueHashFeatureTypeWithChildHash(
+                key,
+                value,
+                node_value_hash,
+                _feature_type,
+                child_hash,
+            ) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVValueHashFeatureTypeWithChildHash node");
+                }
+                // Same element-type check as KVValueHashFeatureType.
+                // Skipped for V0 backwards compatibility.
+                if self.proof_version >= 1 {
+                    let element_type = ElementType::from_serialized_value(value).map_err(|e| {
+                        Error::InvalidProofError(format!(
+                            "cannot determine element type in \
+                                 KVValueHashFeatureTypeWithChildHash node: {e}"
+                        ))
+                    })?;
+                    if element_type.has_simple_value_hash() {
+                        return Err(Error::InvalidProofError(
+                            "KVValueHashFeatureTypeWithChildHash node must not contain \
+                             an item element"
+                                .to_string(),
+                        ));
+                    }
+                }
+                // Verify value integrity: combine_hash(H(value), child_hash) must
+                // equal the provided value_hash. This prevents an attacker from
+                // swapping the serialized element bytes (e.g. changing a CountTree's
+                // count) while reusing the original value_hash.
+                let element_value_hash = value_hash(value).unwrap();
+                let computed_value_hash = combine_hash(&element_value_hash, child_hash).unwrap();
+                if computed_value_hash != *node_value_hash {
+                    return Err(Error::InvalidProofError(format!(
+                        "value/child hash mismatch: combine_hash(H(value), child_hash) \
+                         = {} but value_hash = {}",
+                        hex::encode(computed_value_hash),
+                        hex::encode(node_value_hash)
+                    )));
+                }
+                self.visit_key(items, key, Some(value), *node_value_hash, true, false)?;
+            }
+            Node::Hash(_)
+            | Node::KVHash(_)
+            | Node::KVHashCount(..)
+            | Node::KVHashSum(..)
+            | Node::KVHashCountSum(..) => {
+                if self.in_range {
+                    // `self.in_range` is only set by a node the current item
+                    // contains, which is a result, so `self.output` is never
+                    // empty here. The check keeps the "no stop before
+                    // the first result" rule explicit, as at the other
+                    // stopping point.
+                    if self.limit_mode == ProofLimitMode::UpperBound && !self.output.is_empty() {
+                        // The prover stopped here: it hides everything
+                        // after its last result once its own limit runs
+                        // out. Everything from this node on is
+                        // unrevealed, so the walk ends with the results
+                        // so far.
+                        self.in_range = false;
+                        self.stopped_early = true;
+                    } else {
+                        return Err(Error::InvalidProofError(format!(
+                            "Proof is missing data for query range. Encountered unexpected \
+                             node type: {}",
+                            node
+                        )));
+                    }
+                }
+            }
+            Node::HashWithCount(..) => {
+                // `HashWithCount` is only safe inside the dedicated
+                // aggregate-count verifier, which shape-checks each
+                // collapsed subtree against the queried range. The plain
+                // query verifier does no such shape check, and
+                // `Tree::hash()` for a `HashWithCount` recomputes its
+                // hash from the embedded `(kv_hash, l, r, count)` while
+                // *ignoring* any reconstructed children. A malicious
+                // prover could therefore hang fake KV pushes under a
+                // `HashWithCount`, satisfy `execute_node` from those
+                // pushes (so they appear as query results) while still
+                // preserving the parent's hash chain. Fail fast here so
+                // the regular query path can never accept one.
+                return Err(Error::InvalidProofError(
+                    "HashWithCount node is only valid in aggregate-count proofs; \
+                     encountered in regular query verification"
+                        .to_string(),
+                ));
+            }
+            Node::HashWithSum(..) => {
+                // Same fail-fast rationale as `HashWithCount` above.
+                // `HashWithSum` is reserved for the dedicated
+                // aggregate-sum verifier; it must never reach the
+                // regular query verifier.
+                return Err(Error::InvalidProofError(
+                    "HashWithSum node is only valid in aggregate-sum proofs; \
+                     encountered in regular query verification"
+                        .to_string(),
+                ));
+            }
+            Node::HashWithCountAndSum(..) => {
+                // Same fail-fast rationale as `HashWithCount` /
+                // `HashWithSum`. The combined variant is reserved for
+                // the dedicated aggregate-count and aggregate-sum
+                // verifiers against `ProvableCountProvableSumTree`;
+                // it must never reach the regular query verifier.
+                return Err(Error::InvalidProofError(
+                    "HashWithCountAndSum node is only valid in aggregate-count / \
+                     aggregate-sum proofs; encountered in regular query verification"
+                        .to_string(),
+                ));
+            }
+            Node::KVSum(key, value, _sum) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVSum node");
+                }
+                self.visit_key(
+                    items,
+                    key,
+                    Some(value),
+                    value_hash(value).unwrap(),
+                    false,
+                    false,
+                )?;
+            }
+            Node::KVDigestSum(key, value_hash, _sum) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVDigestSum node");
+                }
+                self.visit_key(items, key, None, *value_hash, false, false)?;
+            }
+            Node::KVRefValueHashSum(key, value, value_hash, _sum) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVRefValueHashSum node");
+                }
+                self.visit_key(items, key, Some(value), *value_hash, false, false)?;
+            }
+            Node::KVCountSum(key, value, _count, _sum) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVCountSum node");
+                }
+                self.visit_key(
+                    items,
+                    key,
+                    Some(value),
+                    value_hash(value).unwrap(),
+                    false,
+                    false,
+                )?;
+            }
+            Node::KVDigestCountSum(key, value_hash, _count, _sum) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVDigestCountSum node");
+                }
+                self.visit_key(items, key, None, *value_hash, false, false)?;
+            }
+            Node::KVRefValueHashCountSum(key, value, value_hash, _count, _sum) => {
+                #[cfg(feature = "proof_debug")]
+                {
+                    println!("Processing KVRefValueHashCountSum node");
+                }
+                self.visit_key(items, key, Some(value), *value_hash, false, false)?;
+            }
+        }
+
+        self.last_push = Some(node.clone());
+
+        Ok(())
+    }
+}
+
+/// `key` comes before the start of `query_item` in walk order, so the walk
+/// moves on without matching it against this item.
+fn before_item(query_item: &QueryItem, key: &[u8], left_to_right: bool) -> bool {
+    let (lower_bound, start_non_inclusive) = query_item.lower_bound();
+    let (upper_bound, end_inclusive) = query_item.upper_bound();
+    if left_to_right {
+        // if the query item is lower unbounded, then a node cannot be less than it.
+        // checks that the lower bound of the query item not greater than the key
+        // if they are equal make sure the start is inclusive
+        !query_item.lower_unbounded()
+            && ((lower_bound.expect("confirmed not unbounded") > key)
+                || (start_non_inclusive && lower_bound.expect("confirmed not unbounded") == key))
+    } else {
+        !query_item.upper_unbounded()
+            && ((upper_bound.expect("confirmed not unbounded") < key)
+                || (!end_inclusive && upper_bound.expect("confirmed not unbounded") == key))
+    }
+}
+
+/// `key` is at or past the end of `query_item` in walk order: the walk
+/// advances to the next item.
+fn past_item_end(query_item: &QueryItem, key: &[u8], left_to_right: bool) -> bool {
+    if left_to_right {
+        query_item.upper_bound().0.is_some() && Some(key) >= query_item.upper_bound().0
+    } else {
+        query_item.lower_bound().0.is_some() && Some(key) <= query_item.lower_bound().0
+    }
+}
+
+/// The proof's ops, checked to be in the op family of the walk direction
+/// (issue #863; see [`QueryProofVerify::execute_proof_with_limit_mode`]).
+struct OrientedOps<'a, 'b> {
+    decoder: &'b mut Decoder<'a>,
+    proof_version: u16,
+    left_to_right: bool,
+}
+
+impl Iterator for OrientedOps<'_, '_> {
+    type Item = Result<Op, Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.decoder.next() {
+            None => None,
+            Some(op_result) => Some(orient_op(op_result, self.proof_version, self.left_to_right)),
+        }
+    }
+}
+
+/// Reject an op outside the walk direction's family (V1 and later).
+fn orient_op(
+    op_result: Result<Op, Error>,
+    proof_version: u16,
+    left_to_right: bool,
+) -> Result<Op, Error> {
+    let op = op_result?;
+    if proof_version >= 1 && op_is_upright(&op) != left_to_right {
+        return Err(Error::InvalidProofError(format!(
+            "Proof op family does not match the query direction: {} op in a {} walk; a \
+             layer proof is emitted entirely in the family of its own direction",
+            if op_is_upright(&op) {
+                "upright"
+            } else {
+                "inverted"
+            },
+            if left_to_right {
+                "left-to-right"
+            } else {
+                "right-to-left"
+            },
+        )));
+    }
+    Ok(op)
 }
 
 #[derive(PartialEq, Eq, Debug, Clone)]
