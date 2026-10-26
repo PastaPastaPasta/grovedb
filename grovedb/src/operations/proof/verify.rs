@@ -339,12 +339,16 @@ enum RowFlow {
 
 /// The read-only inputs shared by every row of one V1 layer. Shared
 /// borrows only; the mutable walk state is passed separately.
+///
+/// `internal_query` comes before `query`: in the extracted Lean structure a
+/// field named `query` would shadow the `query` namespace in the types of the
+/// fields after it.
 #[derive(Clone, Copy)]
 struct V1LayerCtx<'a> {
     lower_layers: &'a BTreeMap<Vec<u8>, LayerProof>,
     prove_options: &'a ProveOptions,
-    query: &'a PathQuery,
     internal_query: &'a SinglePathSubquery<'a>,
+    query: &'a PathQuery,
     current_path: &'a [&'a [u8]],
     options: &'a VerifyOptions,
     current_depth: usize,
