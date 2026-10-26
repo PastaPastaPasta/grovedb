@@ -166,6 +166,8 @@ pub mod replication;
 mod tests;
 #[cfg(feature = "minimal")]
 mod util;
+#[cfg(feature = "verify-extraction")]
+pub mod verify_extraction;
 #[cfg(feature = "minimal")]
 mod visualize;
 
