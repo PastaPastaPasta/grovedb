@@ -604,12 +604,7 @@ impl QueryWalk {
                     // KVBackwardsReferencesValueHash, whose combined
                     // hash is RECOMPUTED — as a KVValueHash the value
                     // bytes would ride unbound on the carried hash.
-                    if matches!(
-                        element_type.base(),
-                        ElementType::ItemWithBackwardsReferences
-                            | ElementType::SumItemWithBackwardsReferences
-                            | ElementType::ItemWithSumItemWithBackwardsReferences
-                    ) {
+                    if is_backwards_reference_element(element_type.base()) {
                         return Err(Error::InvalidProofError(
                             "KVValueHash node must not contain a backward-references \
                              element; use KVBackwardsReferencesValueHash"
@@ -707,12 +702,7 @@ impl QueryWalk {
                         ));
                     }
                     // Same rationale as the KVValueHash guard above.
-                    if matches!(
-                        element_type.base(),
-                        ElementType::ItemWithBackwardsReferences
-                            | ElementType::SumItemWithBackwardsReferences
-                            | ElementType::ItemWithSumItemWithBackwardsReferences
-                    ) {
+                    if is_backwards_reference_element(element_type.base()) {
                         return Err(Error::InvalidProofError(
                             "KVValueHashFeatureType node must not contain a \
                              backward-references element"
@@ -905,6 +895,17 @@ impl QueryWalk {
 
         Ok(())
     }
+}
+
+/// The element type carries backward references, so its value hash is a
+/// combined hash that a value-hash-carrying node would not bind.
+fn is_backwards_reference_element(element_type: ElementType) -> bool {
+    matches!(
+        element_type,
+        ElementType::ItemWithBackwardsReferences
+            | ElementType::SumItemWithBackwardsReferences
+            | ElementType::ItemWithSumItemWithBackwardsReferences
+    )
 }
 
 /// The serialized element is a bidirectional reference.
