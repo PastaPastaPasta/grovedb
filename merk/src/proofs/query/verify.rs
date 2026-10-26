@@ -1574,7 +1574,9 @@ pub fn boundaries_in_proof(proof_bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
     let mut keys = Vec::new();
     for op_result in decoder {
         let op = op_result?;
-        match op {
+        // Borrowed, with the key cloned out: the same keys as moving them
+        // out of `op`, in a shape the extraction translates.
+        match &op {
             Op::Push(Node::KVDigest(k, _))
             | Op::PushInverted(Node::KVDigest(k, _))
             | Op::Push(Node::KVDigestCount(k, _, _))
@@ -1583,7 +1585,7 @@ pub fn boundaries_in_proof(proof_bytes: &[u8]) -> Result<Vec<Vec<u8>>, Error> {
             | Op::PushInverted(Node::KVDigestSum(k, _, _))
             | Op::Push(Node::KVDigestCountSum(k, _, _, _))
             | Op::PushInverted(Node::KVDigestCountSum(k, _, _, _)) => {
-                keys.push(k);
+                keys.push(k.clone());
             }
             _ => {}
         }
