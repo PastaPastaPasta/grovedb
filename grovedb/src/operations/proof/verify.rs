@@ -23,7 +23,7 @@ use crate::operations::proof::util::{
 use crate::{
     operations::proof::{
         indexed_axis::AxisEntries,
-        util::{ProvedPathKeyOptionalValue, ProvedPathKeyValues},
+        util::{ProvedPathKeyOptionalValue, ProvedPathKeyValue, ProvedPathKeyValues},
         AxisDescentProof, GroveDBProof, GroveDBProofV0, GroveDBProofV1, LayerProof,
         MerkOnlyLayerProof, ProofBytes, ProveOptions,
     },
@@ -160,6 +160,51 @@ fn path_to_owned(path: &[&[u8]]) -> Vec<Vec<u8>> {
         i += 1;
     }
     owned
+}
+
+/// Where a V1 walk puts the rows it verifies.
+///
+/// `push_row` converts the row exactly as the matching
+/// `TryFromVersioned<ProvedPathKeyOptionalValue>` conversion does, then
+/// pushes it. A failed conversion pushes nothing.
+pub(crate) trait RowSink {
+    /// Convert `row` and append it.
+    fn push_row(
+        &mut self,
+        row: ProvedPathKeyOptionalValue,
+        grove_version: &GroveVersion,
+    ) -> Result<(), Error>;
+}
+
+impl RowSink for Vec<PathKeyOptionalElementTrio> {
+    /// Same as `TryFromVersioned<ProvedPathKeyOptionalValue> for
+    /// PathKeyOptionalElementTrio`: deserialize the value bytes, if any.
+    fn push_row(
+        &mut self,
+        row: ProvedPathKeyOptionalValue,
+        grove_version: &GroveVersion,
+    ) -> Result<(), Error> {
+        let element = match row.value {
+            Some(value) => Some(Element::deserialize(value.as_slice(), grove_version)?),
+            None => None,
+        };
+        self.push((row.path, row.key, element));
+        Ok(())
+    }
+}
+
+impl RowSink for Vec<ProvedPathKeyValue> {
+    /// Same as `TryFrom<ProvedPathKeyOptionalValue> for ProvedPathKeyValue`
+    /// (which the versioned conversion forwards to): a row without a value
+    /// is an error.
+    fn push_row(
+        &mut self,
+        row: ProvedPathKeyOptionalValue,
+        _grove_version: &GroveVersion,
+    ) -> Result<(), Error> {
+        self.push(ProvedPathKeyValue::try_from(row)?);
+        Ok(())
+    }
 }
 
 /// Whether no axis of a `ProvableCountProvableSumIndexedTree` has a
@@ -712,19 +757,15 @@ impl GroveDb {
     /// `verify_count_offset_on_range_proof` call, the item translation and
     /// the V1 strict-mode rejections of shapes an honest proof never
     /// surfaces.
-    fn run_count_offset_layer_dispatch<T>(
+    fn run_count_offset_layer_dispatch<S: RowSink>(
         query: &PathQuery,
         merk_proof_bytes: &[u8],
         lower_layers_empty: bool,
         current_path: &[&[u8]],
         limit_left: &mut Option<u16>,
-        result: &mut Vec<T>,
+        result: &mut S,
         grove_version: &GroveVersion,
-    ) -> Result<CryptoHash, Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<CryptoHash, Error> {
         let inner_range = query.validate_count_offset_paginated()?.clone();
         let offset = query.query.offset.map(|o| o as u64).unwrap_or(0);
         let limit_u64 = query.query.limit.map(|l| l as u64);
@@ -969,7 +1010,7 @@ impl GroveDb {
                 current_path.iter().map(|p| p.to_vec()).collect(),
                 proved_key_optional_value,
             );
-            result.push(path_key_optional_value.try_into_versioned(grove_version)?);
+            result.push_row(path_key_optional_value, grove_version)?;
             limit_left
                 .iter_mut()
                 .for_each(|limit| *limit = limit.saturating_sub(1));
@@ -1617,7 +1658,7 @@ impl GroveDb {
     /// untrusted peer chooses. Splitting the parameters lets that descent pass
     /// a borrowed slice and a borrowed map, so nothing is copied.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn verify_layer_proof_v1<T>(
+    pub(crate) fn verify_layer_proof_v1<S: RowSink>(
         merk_proof_bytes: &[u8],
         lower_layers: &BTreeMap<Vec<u8>, LayerProof>,
         prove_options: &ProveOptions,
@@ -1625,17 +1666,13 @@ impl GroveDb {
         limit_state: &mut super::V1LimitState,
         inherited_instance: Option<u16>,
         current_path: &[&[u8]],
-        result: &mut Vec<T>,
+        result: &mut S,
         axis_outcomes: &mut Vec<AxisWalkOutcome>,
         last_parent_tree_type: &mut Option<TreeFeatureType>,
         options: &VerifyOptions,
         current_depth: usize,
         grove_version: &GroveVersion,
-    ) -> Result<CryptoHash, Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<CryptoHash, Error> {
         if current_depth > super::MAX_PROOF_DEPTH {
             return Err(invalid_proof(
                 query,
@@ -2024,10 +2061,7 @@ impl GroveDb {
                                             parent_path,
                                             proved_key_value,
                                         );
-                                    result.push(
-                                        path_key_optional_value
-                                            .try_into_versioned(grove_version)?,
-                                    );
+                                    result.push_row(path_key_optional_value, grove_version)?;
                                     limit_state.charge_row_with_instance(&mut frame_instance);
                                     if limit_state.is_exhausted(frame_instance) {
                                         break;
@@ -2042,10 +2076,7 @@ impl GroveDb {
                                                 path_to_owned(&path),
                                                 proved_key_value.clone(),
                                             );
-                                        result.push(
-                                            path_key_optional_value
-                                                .try_into_versioned(grove_version)?,
-                                        );
+                                        result.push_row(path_key_optional_value, grove_version)?;
                                     }
 
                                     // Lower layer must carry cidx-shaped
@@ -2218,10 +2249,7 @@ impl GroveDb {
                                                 path_to_owned(&path),
                                                 proved_key_value.clone(),
                                             );
-                                        result.push(
-                                            path_key_optional_value
-                                                .try_into_versioned(grove_version)?,
-                                        );
+                                        result.push_row(path_key_optional_value, grove_version)?;
                                     }
 
                                     // Dispatch based on lower layer proof type.
@@ -2465,10 +2493,7 @@ impl GroveDb {
                                                 parent_path,
                                                 proved_key_value,
                                             );
-                                        result.push(
-                                            path_key_optional_value
-                                                .try_into_versioned(grove_version)?,
-                                        );
+                                        result.push_row(path_key_optional_value, grove_version)?;
                                         limit_state.charge_row_with_instance(&mut frame_instance);
                                     }
 
@@ -2575,7 +2600,7 @@ impl GroveDb {
                                 path_to_owned(&path),
                                 proved_key_value,
                             );
-                        result.push(path_key_optional_value.try_into_versioned(grove_version)?);
+                        result.push_row(path_key_optional_value, grove_version)?;
                         limit_state.charge_row_with_instance(&mut frame_instance);
                         if limit_state.is_exhausted(frame_instance) {
                             break;
@@ -2612,7 +2637,7 @@ impl GroveDb {
                                     path_to_owned(&path),
                                     proved_key_value.clone(),
                                 );
-                            result.push(path_key_optional_value.try_into_versioned(grove_version)?);
+                            result.push_row(path_key_optional_value, grove_version)?;
                         }
                         // Mirror the prover's charge exactly — global
                         // budget only (it bounds walks across many
@@ -2789,21 +2814,17 @@ impl GroveDb {
     /// (`combine_hash(value_hash || mmr_root)`) and is bound to `parent`
     /// before any leaf is reported.
     #[allow(clippy::too_many_arguments)]
-    fn verify_mmr_lower_layer<T>(
+    fn verify_mmr_lower_layer<S: RowSink>(
         mmr_bytes: &[u8],
         element: &Element,
         parent: ParentCommitment<'_>,
         path: &[&[u8]],
         limit_left: &mut Option<u16>,
-        result: &mut Vec<T>,
+        result: &mut S,
         query: &PathQuery,
         report_contents: bool,
         grove_version: &GroveVersion,
-    ) -> Result<(), Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<(), Error> {
         // Extract the MMR size from the element
         let element_mmr_size = match element {
             Element::MmrTree(mmr_size, ..) => *mmr_size,
@@ -2926,7 +2947,7 @@ impl GroveDb {
                 value: Some(serialized),
                 proof: [0u8; 32],
             };
-            result.push(path_key_optional_value.try_into_versioned(grove_version)?);
+            result.push_row(path_key_optional_value, grove_version)?;
 
             limit_left
                 .iter_mut()
@@ -2944,21 +2965,17 @@ impl GroveDb {
     /// Verifies the proof's internal consistency, binds the computed child
     /// hash to `parent`, and only then reports the queried entries.
     #[allow(clippy::too_many_arguments)]
-    fn verify_bulk_append_lower_layer<T>(
+    fn verify_bulk_append_lower_layer<S: RowSink>(
         bulk_bytes: &[u8],
         element: &Element,
         parent: ParentCommitment<'_>,
         path: &[&[u8]],
         limit_left: &mut Option<u16>,
-        result: &mut Vec<T>,
+        result: &mut S,
         query: &PathQuery,
         report_contents: bool,
         grove_version: &GroveVersion,
-    ) -> Result<(), Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<(), Error> {
         let (child_hash, proof_result) =
             Self::decode_bulk_append_lower_layer(bulk_bytes, element, query)?;
         parent.bind(query, &child_hash)?;
@@ -3045,18 +3062,14 @@ impl GroveDb {
     ///
     /// So every extracted value is a distinct queried position, and a
     /// limited query decodes no more entries than it reports.
-    fn report_bulk_append_entries<T>(
+    fn report_bulk_append_entries<S: RowSink>(
         proof_result: &grovedb_bulk_append_tree::BulkAppendTreeProofResult,
         path: &[&[u8]],
         limit_left: &mut Option<u16>,
-        result: &mut Vec<T>,
+        result: &mut S,
         query: &PathQuery,
         grove_version: &GroveVersion,
-    ) -> Result<(), Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<(), Error> {
         let sub_query = match query.query_items_at_path(path, grove_version)? {
             Some(sub_query) => sub_query,
             None => {
@@ -3119,7 +3132,7 @@ impl GroveDb {
                 value: Some(serialized),
                 proof: [0u8; 32],
             };
-            result.push(path_key_optional_value.try_into_versioned(grove_version)?);
+            result.push_row(path_key_optional_value, grove_version)?;
 
             limit_left
                 .iter_mut()
@@ -3138,21 +3151,17 @@ impl GroveDb {
     /// `blake3("ct_state" || sinsemilla_root || bulk_state_root)`, the child
     /// hash, to `parent`, and only then reports the queried entries.
     #[allow(clippy::too_many_arguments)]
-    fn verify_commitment_tree_lower_layer<T>(
+    fn verify_commitment_tree_lower_layer<S: RowSink>(
         ct_bytes: &[u8],
         element: &Element,
         parent: ParentCommitment<'_>,
         path: &[&[u8]],
         limit_left: &mut Option<u16>,
-        result: &mut Vec<T>,
+        result: &mut S,
         query: &PathQuery,
         report_contents: bool,
         grove_version: &GroveVersion,
-    ) -> Result<(), Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<(), Error> {
         if ct_bytes.len() < 32 {
             return Err(invalid_proof(
                 query,
@@ -3197,21 +3206,17 @@ impl GroveDb {
     /// The computed dense root is the child hash of the parent Merk row and
     /// is bound to `parent` before any entry is reported.
     #[allow(clippy::too_many_arguments)]
-    fn verify_dense_tree_lower_layer<T>(
+    fn verify_dense_tree_lower_layer<S: RowSink>(
         dense_bytes: &[u8],
         element: &Element,
         parent: ParentCommitment<'_>,
         path: &[&[u8]],
         limit_left: &mut Option<u16>,
-        result: &mut Vec<T>,
+        result: &mut S,
         query: &PathQuery,
         report_contents: bool,
         grove_version: &GroveVersion,
-    ) -> Result<(), Error>
-    where
-        T: TryFromVersioned<ProvedPathKeyOptionalValue>,
-        Error: From<<T as TryFromVersioned<ProvedPathKeyOptionalValue>>::Error>,
-    {
+    ) -> Result<(), Error> {
         // Extract the count and height from the authenticated element
         let (element_count, element_height) = match element {
             Element::DenseAppendOnlyFixedSizeTree(count, height, _) => (*count, *height),
@@ -3288,7 +3293,7 @@ impl GroveDb {
                 value: Some(serialized),
                 proof: [0u8; 32],
             };
-            result.push(path_key_optional_value.try_into_versioned(grove_version)?);
+            result.push_row(path_key_optional_value, grove_version)?;
 
             limit_left
                 .iter_mut()
@@ -4896,6 +4901,82 @@ mod axis_helper_tests {
             );
             let old: Vec<(u8, CryptoHash)> = axes.iter().map(|(t, _)| (*t, NULL_HASH)).collect();
             assert_eq!(null_axis_hashes(axes), old, "{axes:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_sink_tests {
+    use grovedb_version::version::GROVE_VERSIONS;
+
+    use super::*;
+    use crate::reference_path::ReferencePathType;
+
+    fn row(value: Option<Vec<u8>>) -> ProvedPathKeyOptionalValue {
+        ProvedPathKeyOptionalValue {
+            path: vec![b"a".to_vec(), Vec::new()],
+            key: b"k".to_vec(),
+            value,
+            proof: [7u8; 32],
+        }
+    }
+
+    /// Absent values, valid encodings of a spread of element kinds, their
+    /// truncations and trailing-byte forms, and a few garbage inputs.
+    fn values() -> Vec<Option<Vec<u8>>> {
+        let grove_version = GroveVersion::latest();
+        let elements = [
+            Element::new_item(b"v".to_vec()),
+            Element::new_item_with_flags(b"v".to_vec(), Some(vec![1, 2])),
+            Element::new_sum_item(-3),
+            Element::empty_tree(),
+            Element::new_tree(Some(b"r".to_vec())),
+            Element::new_sum_tree(None),
+            Element::new_reference(ReferencePathType::SiblingReference(b"s".to_vec())),
+            Element::new_non_counted(Element::new_item(b"n".to_vec())).unwrap(),
+            Element::new_not_summed(Element::new_sum_tree(None)).unwrap(),
+        ];
+        let mut values = vec![None, Some(Vec::new()), Some(vec![0xff; 9])];
+        for element in elements {
+            let bytes = element.serialize(grove_version).unwrap();
+            for len in 0..bytes.len() {
+                values.push(Some(bytes[..len].to_vec()));
+            }
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            values.push(Some(trailing));
+            values.push(Some(bytes));
+        }
+        values
+    }
+
+    #[test]
+    fn push_row_matches_try_into_versioned() {
+        for grove_version in GROVE_VERSIONS {
+            for value in values() {
+                let old: Result<PathKeyOptionalElementTrio, Error> =
+                    row(value.clone()).try_into_versioned(grove_version);
+                let mut trios: Vec<PathKeyOptionalElementTrio> = Vec::new();
+                let new = trios.push_row(row(value.clone()), grove_version);
+                assert_eq!(
+                    format!("{:?}", new.map(|()| trios.clone())),
+                    format!("{:?}", old.map(|trio| vec![trio])),
+                    "{value:?}"
+                );
+
+                // The raw conversion fails with a merk error; the walk's
+                // `?` converted it with `From<grovedb_merk::Error>`.
+                let old: Result<ProvedPathKeyValue, grovedb_merk::Error> =
+                    row(value.clone()).try_into_versioned(grove_version);
+                let old = old.map_err(Error::from);
+                let mut raw: Vec<ProvedPathKeyValue> = Vec::new();
+                let new = raw.push_row(row(value.clone()), grove_version);
+                assert_eq!(
+                    format!("{:?}", new.map(|()| raw)),
+                    format!("{:?}", old.map(|kv| vec![kv])),
+                    "{value:?}"
+                );
+            }
         }
     }
 }
