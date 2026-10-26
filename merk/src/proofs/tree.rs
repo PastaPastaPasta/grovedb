@@ -751,7 +751,12 @@ where
     I: IntoIterator<Item = Result<Op, Error>>,
     F: FnMut(&Node) -> Result<(), Error>,
 {
-    execute_with_visitor(ops, collapse, verify_avl_balance, &mut visit_node)
+    execute_with_visitor(
+        &mut ops.into_iter(),
+        collapse,
+        verify_avl_balance,
+        &mut visit_node,
+    )
 }
 
 #[cfg(any(feature = "minimal", feature = "verify"))]
@@ -773,14 +778,19 @@ impl<F: FnMut(&Node) -> Result<(), Error>> NodeVisitor for F {
 /// [`execute_with_options`] with the per-node callback given as a
 /// [`NodeVisitor`] borrowed mutably, so a caller can keep state in a plain
 /// struct instead of a closure capturing it by `&mut`.
+///
+/// The ops are read with an explicit `while let … = ops.next()` rather than
+/// `for op in &mut *ops`: the latter goes through `<&mut I as IntoIterator>`,
+/// which the formal-verification toolchain does not translate correctly.
+#[allow(clippy::while_let_on_iterator)]
 pub fn execute_with_visitor<I, V>(
-    ops: I,
+    ops: &mut I,
     collapse: bool,
     verify_avl_balance: bool,
     visitor: &mut V,
 ) -> CostResult<Tree, Error>
 where
-    I: IntoIterator<Item = Result<Op, Error>>,
+    I: Iterator<Item = Result<Op, Error>> + ?Sized,
     V: NodeVisitor + ?Sized,
 {
     let mut cost = OperationCost::default();
@@ -795,7 +805,7 @@ where
             .ok_or_else(|| Error::InvalidProofError("Stack underflow".to_string()))
     }
 
-    for op in ops {
+    while let Some(op) = ops.next() {
         op_count += 1;
         if op_count > MAX_PROOF_OPS {
             return Err(Error::InvalidProofError(format!(
