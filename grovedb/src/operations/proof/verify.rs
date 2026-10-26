@@ -719,27 +719,39 @@ impl GroveDb {
         )?;
 
         if options.absence_proofs_for_non_existing_searched_keys {
-            let max_results = query.query.limit.ok_or(Error::NotSupported(
-                "limits must be set in verify_query_with_absence_proof".to_string(),
-            ))? as usize;
-
-            let terminal_keys = query.terminal_keys(max_results, grove_version)?;
-
-            let mut result_set_as_map: BTreeMap<PathKey, Option<Element>> = result
-                .into_iter()
-                .map(|(path, key, element)| ((path, key), element))
-                .collect();
-
-            result = terminal_keys
-                .into_iter()
-                .map(|terminal_key| {
-                    let element = result_set_as_map.remove(&terminal_key).flatten();
-                    (terminal_key.0, terminal_key.1, element)
-                })
-                .collect();
+            result = Self::project_onto_terminal_keys(result, query, grove_version)?;
         }
 
         Ok((root_hash, last_tree_feature_type, result))
+    }
+
+    /// The absence-proof view of a V1 result set: one row per terminal key
+    /// of `query` (bounded by its limit, which must be set), in
+    /// `terminal_keys` order, carrying the element the walk verified for
+    /// that path and key, or `None` when it verified none.
+    fn project_onto_terminal_keys(
+        result: Vec<PathKeyOptionalElementTrio>,
+        query: &PathQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<Vec<PathKeyOptionalElementTrio>, Error> {
+        let max_results = query.query.limit.ok_or(Error::NotSupported(
+            "limits must be set in verify_query_with_absence_proof".to_string(),
+        ))? as usize;
+
+        let terminal_keys = query.terminal_keys(max_results, grove_version)?;
+
+        let mut result_set_as_map: BTreeMap<PathKey, Option<Element>> = result
+            .into_iter()
+            .map(|(path, key, element)| ((path, key), element))
+            .collect();
+
+        Ok(terminal_keys
+            .into_iter()
+            .map(|terminal_key| {
+                let element = result_set_as_map.remove(&terminal_key).flatten();
+                (terminal_key.0, terminal_key.1, element)
+            })
+            .collect())
     }
 
     /// Run the V1 walk for a read-mode (axis-shaped) query, returning
