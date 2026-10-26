@@ -415,34 +415,7 @@ impl QueryWalk {
                 break;
             }
 
-            if !self.in_range {
-                // this is the first data we have encountered for this query item
-                if self.left_to_right {
-                    // ensure lower bound of query item is proven
-                    if !(Some(key.as_slice()) == query_item.lower_bound().0
-                        || self.last_push.is_none()
-                        || is_bound_witness(&self.last_push))
-                    {
-                        // cannot verify the bound - the preceding push is abridged,
-                        // so we cannot tell what the preceding key was
-                        return Err(Error::InvalidProofError(
-                            "Cannot verify lower bound of queried range".to_string(),
-                        ));
-                    }
-                } else {
-                    // ensure upper bound of query item is proven
-                    if !(Some(key.as_slice()) == query_item.upper_bound().0
-                        || self.last_push.is_none()
-                        || is_bound_witness(&self.last_push))
-                    {
-                        // cannot verify the bound - the preceding push is abridged,
-                        // so we cannot tell what the preceding key was
-                        return Err(Error::InvalidProofError(
-                            "Cannot verify upper bound of queried range".to_string(),
-                        ));
-                    }
-                }
-            }
+            self.check_range_start(query_item, key)?;
 
             if past_item_end(query_item, key.as_slice(), self.left_to_right) {
                 // at or past the end of the range in walk order (or this was an
@@ -459,74 +432,120 @@ impl QueryWalk {
 
             // this push matches the queried item
             if query_item.contains(key) {
-                if let Some(val) = value {
-                    // Terminal downgrade guard (V1 strict): the V4
-                    // prover rewrites every bidirectional-reference
-                    // node — result or filler — into a
-                    // KVRefValueHash* node whose target bytes are
-                    // bound by recomputation. One arriving as a plain
-                    // trusted-value result is therefore a
-                    // downgraded/forged node whose bytes ride unbound
-                    // on the carried hash. (Plain references can
-                    // legitimately appear raw in mixed-level V1
-                    // proofs and keep their long-standing handling.)
-                    if plain_trusted_value
-                        && self.proof_version >= 1
-                        && matches!(
-                            ElementType::from_serialized_value(val).map(|et| et.base()),
-                            Ok(ElementType::BidirectionalReference)
-                        )
-                    {
-                        return Err(Error::InvalidProofError(
-                            "bidirectional-reference elements must be dereferenced \
-                             into KVRefValueHash-family nodes in proof results"
-                                .to_string(),
-                        ));
-                    }
-                    if let Some(limit) = self.current_limit {
-                        if limit == 0 {
-                            return Err(Error::InvalidProofError(format!(
-                                "Proof returns more data than limit {:?}",
-                                self.original_limit
-                            )));
-                        } else {
-                            self.current_limit = Some(limit - 1);
-                            if self.current_limit == Some(0) {
-                                self.in_range = false;
-                            }
-                        }
-                    }
-                    #[cfg(feature = "proof_debug")]
-                    {
-                        println!(
-                            "pushing {}",
-                            ProvedKeyOptionalValue {
-                                key: key.clone(),
-                                value: Some(val.clone()),
-                                proof: value_hash,
-                                child_hash_verified,
-                            }
-                        );
-                    }
-                    // add data to output
-                    self.output.push(ProvedKeyOptionalValue {
-                        key: key.clone(),
-                        value: Some(val.clone()),
-                        proof: value_hash,
+                return match value {
+                    Some(val) => self.take_result(
+                        key,
+                        val,
+                        value_hash,
                         child_hash_verified,
-                    });
-
-                    // continue to next push
-                    break;
-                } else {
-                    return Err(Error::InvalidProofError(
+                        plain_trusted_value,
+                    ),
+                    None => Err(Error::InvalidProofError(
                         "Proof is missing data for query".to_string(),
-                    ));
-                }
+                    )),
+                };
             }
-            {}
             // continue to next queried item
         }
+        Ok(())
+    }
+
+    /// The first key the walk meets for `query_item` must prove the start of
+    /// its range: either it is the range's start bound itself, or nothing lies
+    /// between it and the previous push (the first push, or a key-bearing
+    /// one).
+    fn check_range_start(&self, query_item: &QueryItem, key: &[u8]) -> Result<(), Error> {
+        if self.in_range {
+            return Ok(());
+        }
+        // this is the first data we have encountered for this query item
+        if self.left_to_right {
+            // ensure lower bound of query item is proven
+            if !(Some(key) == query_item.lower_bound().0
+                || self.last_push.is_none()
+                || is_bound_witness(&self.last_push))
+            {
+                // cannot verify the bound - the preceding push is abridged,
+                // so we cannot tell what the preceding key was
+                return Err(Error::InvalidProofError(
+                    "Cannot verify lower bound of queried range".to_string(),
+                ));
+            }
+        } else {
+            // ensure upper bound of query item is proven
+            if !(Some(key) == query_item.upper_bound().0
+                || self.last_push.is_none()
+                || is_bound_witness(&self.last_push))
+            {
+                // cannot verify the bound - the preceding push is abridged,
+                // so we cannot tell what the preceding key was
+                return Err(Error::InvalidProofError(
+                    "Cannot verify upper bound of queried range".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Record a matched key's value as a result, counting it against the
+    /// limit.
+    fn take_result(
+        &mut self,
+        key: &[u8],
+        val: &[u8],
+        value_hash: CryptoHash,
+        child_hash_verified: bool,
+        plain_trusted_value: bool,
+    ) -> Result<(), Error> {
+        // Terminal downgrade guard (V1 strict): the V4
+        // prover rewrites every bidirectional-reference
+        // node — result or filler — into a
+        // KVRefValueHash* node whose target bytes are
+        // bound by recomputation. One arriving as a plain
+        // trusted-value result is therefore a
+        // downgraded/forged node whose bytes ride unbound
+        // on the carried hash. (Plain references can
+        // legitimately appear raw in mixed-level V1
+        // proofs and keep their long-standing handling.)
+        if plain_trusted_value && self.proof_version >= 1 && is_bidirectional_reference_value(val) {
+            return Err(Error::InvalidProofError(
+                "bidirectional-reference elements must be dereferenced \
+                 into KVRefValueHash-family nodes in proof results"
+                    .to_string(),
+            ));
+        }
+        if let Some(limit) = self.current_limit {
+            if limit == 0 {
+                return Err(Error::InvalidProofError(format!(
+                    "Proof returns more data than limit {:?}",
+                    self.original_limit
+                )));
+            } else {
+                self.current_limit = Some(limit - 1);
+                if self.current_limit == Some(0) {
+                    self.in_range = false;
+                }
+            }
+        }
+        #[cfg(feature = "proof_debug")]
+        {
+            println!(
+                "pushing {}",
+                ProvedKeyOptionalValue {
+                    key: key.to_vec(),
+                    value: Some(val.to_vec()),
+                    proof: value_hash,
+                    child_hash_verified,
+                }
+            );
+        }
+        // add data to output
+        self.output.push(ProvedKeyOptionalValue {
+            key: key.to_vec(),
+            value: Some(val.to_vec()),
+            proof: value_hash,
+            child_hash_verified,
+        });
         Ok(())
     }
 
@@ -886,6 +905,14 @@ impl QueryWalk {
 
         Ok(())
     }
+}
+
+/// The serialized element is a bidirectional reference.
+fn is_bidirectional_reference_value(val: &[u8]) -> bool {
+    matches!(
+        ElementType::from_serialized_value(val).map(|et| et.base()),
+        Ok(ElementType::BidirectionalReference)
+    )
 }
 
 /// A pushed node that reveals a key, so it witnesses the bound next to it:
