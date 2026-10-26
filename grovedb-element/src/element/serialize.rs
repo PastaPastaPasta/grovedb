@@ -123,11 +123,24 @@ impl Element {
     /// The manual bincode decoder validates wrapper nesting from decoded
     /// discriminants before descending. Collection allocation safeguards are
     /// provided by the explicit grovedb-bincode untrusted decoder.
+    ///
+    /// Runs, in order: [`Self::decode_element_untrusted`] (bincode plus the
+    /// consumed-all-bytes check), [`Self::validate_wrapper_shape`] and
+    /// [`Self::validate_element_limits`].
     pub fn deserialize(bytes: &[u8], grove_version: &GroveVersion) -> Result<Self, ElementError> {
         check_grovedb_v0!(
             "Element::deserialize",
             grove_version.grovedb_versions.element.deserialize
         );
+        let elem = Self::decode_element_untrusted(bytes)?;
+        elem.validate_wrapper_shape()?;
+        elem.validate_element_limits()?;
+        Ok(elem)
+    }
+
+    /// Bincode-decodes `bytes` and rejects trailing bytes. No invariant
+    /// validation beyond what the decoder itself does.
+    fn decode_element_untrusted(bytes: &[u8]) -> Result<Self, ElementError> {
         let config = config::standard().with_big_endian().with_no_limit();
         let (elem, consumed): (Element, usize) =
             bincode::decode_from_slice_untrusted(bytes, config).map_err(|e| {
@@ -140,9 +153,16 @@ impl Element {
                 bytes.len()
             )));
         }
+        Ok(elem)
+    }
+
+    /// Wrapper invariants of a decoded element: no wrapper inside a
+    /// wrapper, no backward-references element under `NonCounted`, and
+    /// `NotSummed` / `NotCountedOrSummed` only around sum-bearing trees.
+    fn validate_wrapper_shape(&self) -> Result<(), ElementError> {
         // Keep this public-boundary validation so its error remains an
         // ElementError even if another decoder implementation is introduced.
-        if let Element::NonCounted(inner) = &elem
+        if let Element::NonCounted(inner) = self
             && matches!(
                 **inner,
                 Element::NonCounted(_) | Element::NotSummed(_) | Element::NotCountedOrSummed(_)
@@ -152,7 +172,7 @@ impl Element {
                 "deserialized NonCounted wrapping another wrapper".to_string(),
             ));
         }
-        if let Element::NonCounted(inner) = &elem
+        if let Element::NonCounted(inner) = self
             && matches!(
                 **inner,
                 Element::BidirectionalReference(..)
@@ -165,7 +185,7 @@ impl Element {
                 "deserialized NonCounted wrapping a backward-references element".to_string(),
             ));
         }
-        if let Element::NotSummed(inner) = &elem {
+        if let Element::NotSummed(inner) = self {
             match **inner {
                 Element::SumTree(..)
                 | Element::BigSumTree(..)
@@ -180,7 +200,7 @@ impl Element {
                 }
             }
         }
-        if let Element::NotCountedOrSummed(inner) = &elem {
+        if let Element::NotCountedOrSummed(inner) = self {
             match **inner {
                 Element::SumTree(..)
                 | Element::BigSumTree(..)
@@ -196,25 +216,31 @@ impl Element {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Private-document-store config and backward-references limits of a
+    /// decoded element, checked in that order.
+    fn validate_element_limits(&self) -> Result<(), ElementError> {
         // Reject a PrivateDocumentStore with an unusable committed config
         // (entry_size 0 or chunk_power outside 1..=16). No such bytes can
         // legitimately exist — serialization and every insert path enforce
         // the same bound — so this cannot reject previously-valid data;
         // it makes the invalid configuration unrepresentable, mirroring
         // the wrapper-invariant checks above.
-        if let Err(e) = elem.validate_private_document_store_config() {
+        if let Err(e) = self.validate_private_document_store_config() {
             return Err(ElementError::CorruptedData(format!(
                 "deserialized private document store with invalid config: {}",
                 e
             )));
         }
-        if let Err(e) = elem.validate_backward_references_limits() {
+        if let Err(e) = self.validate_backward_references_limits() {
             return Err(ElementError::CorruptedData(format!(
                 "deserialized element with invalid backward references: {}",
                 e
             )));
         }
-        Ok(elem)
+        Ok(())
     }
 }
 
@@ -635,6 +661,192 @@ mod tests {
                     let decoded: Element = serde_json::from_str(&json).unwrap();
                     assert_eq!(decoded, element);
                 }
+            }
+        }
+    }
+
+    /// `Element::deserialize` as it was before the decode / wrapper-shape /
+    /// limits split, kept verbatim as the reference for the differential
+    /// test below.
+    fn deserialize_reference(
+        bytes: &[u8],
+        grove_version: &GroveVersion,
+    ) -> Result<Element, ElementError> {
+        check_grovedb_v0!(
+            "Element::deserialize",
+            grove_version.grovedb_versions.element.deserialize
+        );
+        let config = config::standard().with_big_endian().with_no_limit();
+        let (elem, consumed): (Element, usize) =
+            bincode::decode_from_slice_untrusted(bytes, config).map_err(|e| {
+                ElementError::CorruptedData(format!("unable to deserialize element {}", e))
+            })?;
+        if consumed != bytes.len() {
+            return Err(ElementError::CorruptedData(format!(
+                "element deserialization did not consume all bytes: consumed {}, total {}",
+                consumed,
+                bytes.len()
+            )));
+        }
+        // Keep this public-boundary validation so its error remains an
+        // ElementError even if another decoder implementation is introduced.
+        if let Element::NonCounted(inner) = &elem
+            && matches!(
+                **inner,
+                Element::NonCounted(_) | Element::NotSummed(_) | Element::NotCountedOrSummed(_)
+            )
+        {
+            return Err(ElementError::CorruptedData(
+                "deserialized NonCounted wrapping another wrapper".to_string(),
+            ));
+        }
+        if let Element::NonCounted(inner) = &elem
+            && matches!(
+                **inner,
+                Element::BidirectionalReference(..)
+                    | Element::ItemWithBackwardsReferences(..)
+                    | Element::SumItemWithBackwardsReferences(..)
+                    | Element::ItemWithSumItemWithBackwardsReferences(..)
+            )
+        {
+            return Err(ElementError::CorruptedData(
+                "deserialized NonCounted wrapping a backward-references element".to_string(),
+            ));
+        }
+        if let Element::NotSummed(inner) = &elem {
+            match **inner {
+                Element::SumTree(..)
+                | Element::BigSumTree(..)
+                | Element::CountSumTree(..)
+                | Element::ProvableCountSumTree(..)
+                | Element::ProvableSumTree(..)
+                | Element::ProvableCountProvableSumTree(..) => {}
+                _ => {
+                    return Err(ElementError::CorruptedData(
+                        "deserialized NotSummed with non-sum-tree inner".to_string(),
+                    ));
+                }
+            }
+        }
+        if let Element::NotCountedOrSummed(inner) = &elem {
+            match **inner {
+                Element::SumTree(..)
+                | Element::BigSumTree(..)
+                | Element::CountSumTree(..)
+                | Element::ProvableCountSumTree(..)
+                | Element::ProvableSumTree(..)
+                | Element::ProvableCountProvableSumTree(..) => {}
+                _ => {
+                    return Err(ElementError::CorruptedData(
+                        "deserialized NotCountedOrSummed with non-sum-bearing-tree inner"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        // Reject a PrivateDocumentStore with an unusable committed config
+        // (entry_size 0 or chunk_power outside 1..=16). No such bytes can
+        // legitimately exist — serialization and every insert path enforce
+        // the same bound — so this cannot reject previously-valid data;
+        // it makes the invalid configuration unrepresentable, mirroring
+        // the wrapper-invariant checks above.
+        if let Err(e) = elem.validate_private_document_store_config() {
+            return Err(ElementError::CorruptedData(format!(
+                "deserialized private document store with invalid config: {}",
+                e
+            )));
+        }
+        if let Err(e) = elem.validate_backward_references_limits() {
+            return Err(ElementError::CorruptedData(format!(
+                "deserialized element with invalid backward references: {}",
+                e
+            )));
+        }
+        Ok(elem)
+    }
+
+    /// xorshift64*, deterministic so failures reproduce.
+    fn next_rand(state: &mut u64) -> u64 {
+        *state ^= *state >> 12;
+        *state ^= *state << 25;
+        *state ^= *state >> 27;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn assert_same_deserialize(bytes: &[u8], grove_version: &GroveVersion) {
+        let new = Element::deserialize(bytes, grove_version);
+        let old = deserialize_reference(bytes, grove_version);
+        assert_eq!(
+            format!("{new:?}"),
+            format!("{old:?}"),
+            "bytes {}",
+            hex::encode(bytes)
+        );
+    }
+
+    #[test]
+    fn split_deserialize_matches_the_reference_decoder() {
+        let config = config::standard().with_big_endian().with_no_limit();
+        let flags = || Some(vec![1u8]);
+        let mut elements = every_element_variant();
+        // Wrapper-shape and limit violations, encoded without the
+        // `serialize` checks.
+        let mut invalid = vec![
+            Element::PrivateDocumentStore(1, 0, 4, flags()),
+            Element::PrivateDocumentStore(1, 70_000, 4, flags()),
+            Element::PrivateDocumentStore(1, 32, 0, flags()),
+            Element::PrivateDocumentStore(1, 32, 17, flags()),
+            Element::ItemWithBackwardsReferences(
+                vec![1],
+                crate::BackwardReferences::with_max_incoming(u16::MAX),
+                flags(),
+            ),
+            Element::SumItemWithBackwardsReferences(
+                1,
+                crate::BackwardReferences::with_max_incoming(257),
+                flags(),
+            ),
+        ];
+        for inner in every_element_variant() {
+            invalid.push(Element::NonCounted(Box::new(inner.clone())));
+            invalid.push(Element::NotSummed(Box::new(inner.clone())));
+            invalid.push(Element::NotCountedOrSummed(Box::new(inner)));
+        }
+        elements.extend(invalid);
+
+        let mut corpus: Vec<Vec<u8>> = Vec::new();
+        for element in &elements {
+            let Ok(bytes) = bincode::encode_to_vec(element, config) else {
+                continue;
+            };
+            let mut trailing = bytes.clone();
+            trailing.push(0);
+            corpus.push(trailing);
+            for len in 0..bytes.len() {
+                corpus.push(bytes[..len].to_vec());
+            }
+            for i in 0..bytes.len() {
+                for mask in [0x01u8, 0x80, 0xff] {
+                    let mut mutated = bytes.clone();
+                    mutated[i] ^= mask;
+                    corpus.push(mutated);
+                }
+            }
+            corpus.push(bytes);
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            let len = (next_rand(&mut state) % 24) as usize;
+            let mut bytes: Vec<u8> = (0..len).map(|_| next_rand(&mut state) as u8).collect();
+            if let Some(first) = bytes.first_mut() {
+                *first %= 32;
+            }
+            corpus.push(bytes);
+        }
+
+        for grove_version in GROVE_VERSIONS {
+            for bytes in &corpus {
+                assert_same_deserialize(bytes, grove_version);
             }
         }
     }
