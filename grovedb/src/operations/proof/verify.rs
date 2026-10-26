@@ -286,6 +286,25 @@ fn null_axis_hashes(axes: &[(u8, Option<Vec<u8>>)]) -> Vec<(u8, CryptoHash)> {
     hashes
 }
 
+/// The first key of `lower_layers`, in ascending key order, that is not in
+/// `verified_keys`; `None` when every lower layer was requested. Only the
+/// error message depends on which key this is.
+///
+/// A plain loop rather than `keys().find(..)`, to keep closures off the
+/// verifier path.
+#[allow(clippy::manual_find)]
+fn first_unrequested_lower_layer<'a>(
+    lower_layers: &'a BTreeMap<Vec<u8>, LayerProof>,
+    verified_keys: &BTreeSet<Vec<u8>>,
+) -> Option<&'a Vec<u8>> {
+    for key in lower_layers.keys() {
+        if !verified_keys.contains(key) {
+            return Some(key);
+        }
+    }
+    None
+}
+
 impl GroveDb {
     /// Verifies a proof against a path query with the given options, returning
     /// the root hash and deserialized results.
@@ -1958,18 +1977,16 @@ impl GroveDb {
 
         // Succinctness check: reject proof if it contains lower layers
         // for keys that the query did not require
-        if options.verify_proof_succinctness {
-            for key in lower_layers.keys() {
-                if !verified_keys.contains(key) {
-                    return Err(invalid_proof(
-                        query,
-                        format!(
-                            "V1 proof contains extra lower layer for key {} not required by query",
-                            hex::encode(key),
-                        ),
-                    ));
-                }
-            }
+        if options.verify_proof_succinctness
+            && let Some(key) = first_unrequested_lower_layer(lower_layers, &verified_keys)
+        {
+            return Err(invalid_proof(
+                query,
+                format!(
+                    "V1 proof contains extra lower layer for key {} not required by query",
+                    hex::encode(key),
+                ),
+            ));
         }
 
         Ok(root_hash)
@@ -5287,6 +5304,109 @@ mod axis_helper_tests {
             let old: Vec<(u8, CryptoHash)> = axes.iter().map(|(t, _)| (*t, NULL_HASH)).collect();
             assert_eq!(null_axis_hashes(axes), old, "{axes:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod lower_layer_helper_tests {
+    use super::*;
+
+    /// The succinctness check as `verify_layer_proof_v1` wrote it before
+    /// `first_unrequested_lower_layer`: the message of the error it
+    /// returned, if any.
+    #[allow(clippy::manual_find)]
+    fn old_succinctness(
+        lower_layers: &BTreeMap<Vec<u8>, LayerProof>,
+        verified_keys: &BTreeSet<Vec<u8>>,
+    ) -> Option<String> {
+        for key in lower_layers.keys() {
+            if !verified_keys.contains(key) {
+                return Some(format!(
+                    "V1 proof contains extra lower layer for key {} not required by query",
+                    hex::encode(key),
+                ));
+            }
+        }
+        None
+    }
+
+    /// The same check through the helper, as `verify_layer_proof_v1` now
+    /// writes it.
+    fn new_succinctness(
+        lower_layers: &BTreeMap<Vec<u8>, LayerProof>,
+        verified_keys: &BTreeSet<Vec<u8>>,
+    ) -> Option<String> {
+        if let Some(key) = first_unrequested_lower_layer(lower_layers, verified_keys) {
+            return Some(format!(
+                "V1 proof contains extra lower layer for key {} not required by query",
+                hex::encode(key),
+            ));
+        }
+        None
+    }
+
+    fn layer() -> LayerProof {
+        LayerProof {
+            merk_proof: ProofBytes::Merk(Vec::new()),
+            lower_layers: BTreeMap::new(),
+        }
+    }
+
+    /// Every subset of a six-key universe as the lower layers, against every
+    /// subset of that universe plus one key outside it as the verified set.
+    #[test]
+    fn first_unrequested_lower_layer_matches_keys_loop() {
+        let universe: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0],
+            vec![0, 0],
+            vec![1],
+            vec![1, 2],
+            vec![0xff],
+        ];
+        let mut verified_universe = universe.clone();
+        verified_universe.push(vec![9, 9]);
+        let mut checked = 0usize;
+        let mut found = 0usize;
+        for layer_mask in 0u32..(1 << universe.len()) {
+            let lower_layers: BTreeMap<Vec<u8>, LayerProof> = (0..universe.len())
+                .filter(|i| layer_mask & (1 << i) != 0)
+                .map(|i| (universe[i].clone(), layer()))
+                .collect();
+            for verified_mask in 0u32..(1 << verified_universe.len()) {
+                let verified_keys: BTreeSet<Vec<u8>> = (0..verified_universe.len())
+                    .filter(|i| verified_mask & (1 << i) != 0)
+                    .map(|i| verified_universe[i].clone())
+                    .collect();
+                assert_eq!(
+                    new_succinctness(&lower_layers, &verified_keys),
+                    old_succinctness(&lower_layers, &verified_keys),
+                    "{:?} {verified_keys:?}",
+                    lower_layers.keys().collect::<Vec<_>>()
+                );
+                // Spec: the smallest lower-layer key that was not verified,
+                // borrowed from the map itself.
+                let found_key = first_unrequested_lower_layer(&lower_layers, &verified_keys);
+                let smallest = lower_layers
+                    .keys()
+                    .filter(|k| !verified_keys.contains(*k))
+                    .min();
+                assert_eq!(
+                    found_key,
+                    smallest,
+                    "{:?} {verified_keys:?}",
+                    lower_layers.keys().collect::<Vec<_>>()
+                );
+                if let Some(key) = found_key {
+                    let (map_key, _) = lower_layers.get_key_value(key).unwrap();
+                    assert!(std::ptr::eq(key, map_key));
+                    found += 1;
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, 64 * 128);
+        assert!(found > 0 && found < checked);
     }
 }
 
