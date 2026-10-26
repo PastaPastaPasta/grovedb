@@ -164,8 +164,8 @@ enum DenseLowerRoot {
 /// `Error::InvalidProof` for a V1 verifier rejection. Out of line so the
 /// verifier clones the query only on the error path.
 #[cold]
-fn invalid_proof(query: &PathQuery, message: String) -> Error {
-    Error::InvalidProof(query.clone(), message)
+fn invalid_proof(path_query: &PathQuery, message: String) -> Error {
+    Error::InvalidProof(path_query.clone(), message)
 }
 
 /// `Error::CorruptedPath` for a V1 layer whose `path` is not part of
@@ -405,7 +405,7 @@ impl GroveDb {
     /// the root hash and deserialized results.
     pub fn verify_query_with_options(
         proof: &[u8],
-        query: &PathQuery,
+        path_query: &PathQuery,
         options: VerifyOptions,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, Vec<PathKeyOptionalElementTrio>), Error> {
@@ -419,7 +419,7 @@ impl GroveDb {
         );
         if options.absence_proofs_for_non_existing_searched_keys {
             // must have a limit
-            query.query.limit.ok_or(Error::NotSupported(
+            path_query.query.limit.ok_or(Error::NotSupported(
                 "limits must be set in verify_query_with_absence_proof".to_string(),
             ))?;
         }
@@ -438,16 +438,16 @@ impl GroveDb {
         // this verifier cannot serve should refuse without paying for
         // (or error-shadowing) that parse. `verify_proof_internal`
         // re-checks as defense in depth.
-        query.reject_unserved_per_instance_limits(grove_version)?;
+        path_query.reject_unserved_per_instance_limits(grove_version)?;
         if options.absence_proofs_for_non_existing_searched_keys {
-            query.reject_per_instance_limits("absence-proof verification")?;
-            query.reject_absence_proofs_with_offset()?;
+            path_query.reject_per_instance_limits("absence-proof verification")?;
+            path_query.reject_absence_proofs_with_offset()?;
         }
 
         let grovedb_proof = super::decode_grovedb_proof_canonical(proof)?;
 
         let (root_hash, _, result) =
-            Self::verify_proof_internal(&grovedb_proof, query, options, grove_version)?;
+            Self::verify_proof_internal(&grovedb_proof, path_query, options, grove_version)?;
 
         Ok((root_hash, result))
     }
@@ -543,7 +543,7 @@ impl GroveDb {
 
     pub(crate) fn verify_proof_internal(
         proof: &GroveDBProof,
-        query: &PathQuery,
+        path_query: &PathQuery,
         options: VerifyOptions,
         grove_version: &GroveVersion,
     ) -> Result<
@@ -558,7 +558,7 @@ impl GroveDb {
         // this verifier. Fail closed rather than misreading such a
         // query as key selection and accepting a proof about the wrong
         // thing.
-        query.reject_unserved_read_mode()?;
+        path_query.reject_unserved_read_mode()?;
 
         // Per-instance limit gate: served by the V1 verifier from
         // GROVE_V4; older grove versions fail closed, and zero caps are
@@ -567,15 +567,15 @@ impl GroveDb {
         // expected key the proof did not carry as absent, and which
         // keys an instance-capped walk carries is data-dependent — keys
         // beyond a cap would masquerade as proven-absent.
-        query.reject_unserved_per_instance_limits(grove_version)?;
+        path_query.reject_unserved_per_instance_limits(grove_version)?;
         if options.absence_proofs_for_non_existing_searched_keys {
-            query.reject_per_instance_limits("absence-proof verification")?;
+            path_query.reject_per_instance_limits("absence-proof verification")?;
             // Same fail-closed reasoning for pagination: a count-offset
             // proof does not reveal which rows the offset skipped, so
             // the terminal-keys projection would report them as
             // absent. Envelope-independent, so it runs before the
             // V0/V1 offset gate below.
-            query.reject_absence_proofs_with_offset()?;
+            path_query.reject_absence_proofs_with_offset()?;
         }
 
         // Offset gate centralized in `apply_count_offset_envelope_gate`:
@@ -585,17 +585,17 @@ impl GroveDb {
         // validates as offset-paginated. The tree-type check
         // (ProvableCountTree / ProvableCountSumTree) happens at
         // leaf-dispatch time inside `run_count_offset_layer_dispatch`.
-        Self::apply_count_offset_envelope_gate(proof, query)?;
+        Self::apply_count_offset_envelope_gate(proof, path_query)?;
 
         match proof {
             GroveDBProof::V0(proof_v0) => {
                 // The V0 verifier is a frozen wire format whose limit
                 // accounting predates per-instance caps.
-                query.reject_per_instance_limits("the V0 verifier")?;
-                Self::verify_proof_v0_internal(proof_v0, query, options, grove_version)
+                path_query.reject_per_instance_limits("the V0 verifier")?;
+                Self::verify_proof_v0_internal(proof_v0, path_query, options, grove_version)
             }
             GroveDBProof::V1(proof_v1) => {
-                Self::verify_proof_v1_internal(proof_v1, query, options, grove_version)
+                Self::verify_proof_v1_internal(proof_v1, path_query, options, grove_version)
             }
         }
     }
@@ -612,9 +612,9 @@ impl GroveDb {
     /// V1-relaxes contract identical across every public entry point.
     fn apply_count_offset_envelope_gate(
         proof: &GroveDBProof,
-        query: &PathQuery,
+        path_query: &PathQuery,
     ) -> Result<(), Error> {
-        if !query.has_non_zero_offset() {
+        if !path_query.has_non_zero_offset() {
             return Ok(());
         }
         match proof {
@@ -622,7 +622,7 @@ impl GroveDb {
                 "offsets in path queries are not supported for proofs".to_string(),
             )),
             GroveDBProof::V1(_) => {
-                query.validate_count_offset_paginated()?;
+                path_query.validate_count_offset_paginated()?;
                 Ok(())
             }
         }
@@ -1592,7 +1592,7 @@ impl GroveDb {
     /// node at `path` must be a sum-budget read, whose budget is returned.
     fn sum_budget_window_gate(
         path: &[&[u8]],
-        query: &PathQuery,
+        path_query: &PathQuery,
         grove_version: &GroveVersion,
     ) -> Result<SumBudgetRead, Error> {
         // Envelope gate: sum-budget windows are a V4 acceptance rule.
@@ -1609,9 +1609,9 @@ impl GroveDb {
                     .to_string(),
             ));
         }
-        let Some(budget) = query.sum_budget_read_at_path(path).copied() else {
+        let Some(budget) = path_query.sum_budget_read_at_path(path).copied() else {
             return Err(invalid_proof(
-                query,
+                path_query,
                 "the proof carries a sum-budget window at a path whose query node is not a \
                  sum-budget read"
                     .to_string(),
@@ -1879,7 +1879,7 @@ impl GroveDb {
         merk_proof_bytes: &[u8],
         lower_layers: &BTreeMap<Vec<u8>, LayerProof>,
         prove_options: &ProveOptions,
-        query: &PathQuery,
+        path_query: &PathQuery,
         limit_state: &mut super::V1LimitState,
         inherited_instance: Option<u16>,
         current_path: &[&[u8]],
@@ -1892,7 +1892,7 @@ impl GroveDb {
     ) -> Result<CryptoHash, Error> {
         if current_depth > super::MAX_PROOF_DEPTH {
             return Err(invalid_proof(
-                query,
+                path_query,
                 "proof verification exceeded maximum depth limit".to_string(),
             ));
         }
@@ -1910,7 +1910,7 @@ impl GroveDb {
         // verifier pipeline expects, and return the leaf merk's root
         // hash so the parent layer's `combine_hash(H(value),
         // lower_hash)` chain check matches.
-        if current_path.len() == query.path.len() && query.has_non_zero_offset() {
+        if current_path.len() == path_query.path.len() && path_query.has_non_zero_offset() {
             // Count-offset queries reject per-instance limits, so the
             // effective budget here is just the global one; the temp
             // keeps the dispatch's own accounting and reports the
@@ -1918,7 +1918,7 @@ impl GroveDb {
             let mut count_offset_limit = limit_state.effective_layer_limit(inherited_instance);
             let count_offset_before = count_offset_limit;
             let dispatch_result = Self::run_count_offset_layer_dispatch(
-                query,
+                path_query,
                 merk_proof_bytes,
                 lower_layers.is_empty(),
                 current_path,
@@ -1933,9 +1933,9 @@ impl GroveDb {
             return dispatch_result;
         }
 
-        let internal_query = match query.query_items_at_path(current_path, grove_version)? {
+        let internal_query = match path_query.query_items_at_path(current_path, grove_version)? {
             Some(internal_query) => internal_query,
-            None => return Err(corrupted_layer_path("verify v1", current_path, query)),
+            None => return Err(corrupted_layer_path("verify v1", current_path, path_query)),
         };
 
         // This frame's per-instance budget — fresh for this subtree,
@@ -1988,7 +1988,7 @@ impl GroveDb {
             grovedb_merk::proofs::query::proof_stream_direction(merk_proof_bytes)
                 .map_err(|e| {
                     invalid_proof(
-                        query,
+                        path_query,
                         format!("Invalid V1 proof op stream at path component layer: {}", e),
                     )
                 })?
@@ -2027,7 +2027,7 @@ impl GroveDb {
             .unwrap()
             .map_err(|e| {
                 invalid_proof(
-                    query,
+                    path_query,
                     format!("Invalid V1 proof verification parameters: {}", e),
                 )
             })?;
@@ -2043,7 +2043,7 @@ impl GroveDb {
             let ctx = V1LayerCtx {
                 lower_layers,
                 prove_options,
-                query,
+                query: path_query,
                 internal_query: &internal_query,
                 current_path,
                 options,
@@ -2071,7 +2071,7 @@ impl GroveDb {
             && let Some(key) = first_unrequested_lower_layer(lower_layers, &verified_keys)
         {
             return Err(invalid_proof(
-                query,
+                path_query,
                 format!(
                     "V1 proof contains extra lower layer for key {} not required by query",
                     hex::encode(key),

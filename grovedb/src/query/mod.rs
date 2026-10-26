@@ -325,11 +325,7 @@ impl SizedQuery {
             | QueryItem::RangeAfter(_)
             | QueryItem::RangeAfterTo(_)
             | QueryItem::RangeAfterToInclusive(_) => Ok(item),
-            QueryItem::Key(_) => Err(Error::InvalidQuery(
-                "count-offset paginated queries do not support QueryItem::Key — a \
-                 single-key match has at most one in-range item, so offset > 0 is \
-                 guaranteed to return zero items. Use a range variant instead",
-            )),
+            QueryItem::Key(_) => Err(count_offset_key_unsupported()),
             QueryItem::AggregateCountOnRange(_)
             | QueryItem::AggregateSumOnRange(_)
             | QueryItem::AggregateCountAndSumOnRange(_) => Err(Error::InvalidQuery(
@@ -1209,15 +1205,15 @@ impl PathQuery {
                 .should_add_parent_tree_at_path
         );
 
-        fn recursive_should_add_parent_tree_at_path(query: &Query, path: &[&[u8]]) -> bool {
+        fn recursive_should_add_parent_tree_at_path(query_node: &Query, path: &[&[u8]]) -> bool {
             if path.is_empty() {
-                return query.add_parent_tree_on_subquery;
+                return query_node.add_parent_tree_on_subquery;
             }
 
             let key = path[0];
             let path_after_top_removed = &path[1..];
 
-            if let Some(conditional_branches) = &query.conditional_subquery_branches
+            if let Some(conditional_branches) = &query_node.conditional_subquery_branches
                 && let Some(index) = first_branch_containing(conditional_branches, key)
                 && let Some((_, subquery_branch)) = conditional_branches.get_index(index)
             {
@@ -1251,11 +1247,11 @@ impl PathQuery {
                 return false;
             }
 
-            if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
+            if let Some(subquery_path) = &query_node.default_subquery_branch.subquery_path {
                 if path_after_top_removed.len() <= subquery_path.len() {
                     if common_prefix_eq(path_after_top_removed, subquery_path) {
                         return if path_after_top_removed.len() == subquery_path.len() {
-                            match &query.default_subquery_branch.subquery {
+                            match &query_node.default_subquery_branch.subquery {
                                 Some(subquery) => subquery.add_parent_tree_on_subquery,
                                 None => false,
                             }
@@ -1264,14 +1260,14 @@ impl PathQuery {
                         };
                     }
                 } else if common_prefix_eq(path_after_top_removed, subquery_path)
-                    && let Some(subquery) = &query.default_subquery_branch.subquery
+                    && let Some(subquery) = &query_node.default_subquery_branch.subquery
                 {
                     return recursive_should_add_parent_tree_at_path(
                         subquery,
                         &path_after_top_removed[subquery_path.len()..],
                     );
                 }
-            } else if let Some(subquery) = &query.default_subquery_branch.subquery {
+            } else if let Some(subquery) = &query_node.default_subquery_branch.subquery {
                 return recursive_should_add_parent_tree_at_path(subquery, path_after_top_removed);
             }
 
@@ -1347,20 +1343,20 @@ impl PathQuery {
         /// way `query_items_at_path`'s resolver does — but returning
         /// the node itself rather than its per-layer view, and `None`
         /// for mid-`subquery_path` positions.
-        fn resolve_node_at_path<'b>(query: &'b Query, path: &[&[u8]]) -> Option<&'b Query> {
+        fn resolve_node_at_path<'b>(query_node: &'b Query, path: &[&[u8]]) -> Option<&'b Query> {
             if path.is_empty() {
-                return Some(query);
+                return Some(query_node);
             }
             let key = path[0];
             let rest = &path[1..];
 
-            if let Some(conditional_branches) = &query.conditional_subquery_branches
+            if let Some(conditional_branches) = &query_node.conditional_subquery_branches
                 && let Some(index) = first_branch_containing(conditional_branches, key)
                 && let Some((_, subquery_branch)) = conditional_branches.get_index(index)
             {
                 return resolve_branch_at_path(subquery_branch, rest);
             }
-            resolve_branch_at_path(&query.default_subquery_branch, rest)
+            resolve_branch_at_path(&query_node.default_subquery_branch, rest)
         }
 
         fn resolve_branch_at_path<'b>(
@@ -1418,17 +1414,17 @@ impl PathQuery {
         // verifier path.
         #[allow(clippy::manual_map)]
         fn recursive_query_items<'b>(
-            query: &'b Query,
+            query_node: &'b Query,
             path: &[&[u8]],
         ) -> Option<SinglePathSubquery<'b>> {
             if path.is_empty() {
-                return Some(SinglePathSubquery::from_query(query));
+                return Some(SinglePathSubquery::from_query(query_node));
             }
 
             let key = path[0];
             let path_after_top_removed = &path[1..];
 
-            if let Some(conditional_branches) = &query.conditional_subquery_branches
+            if let Some(conditional_branches) = &query_node.conditional_subquery_branches
                 && let Some(index) = first_branch_containing(conditional_branches, key)
                 && let Some((_, subquery_branch)) = conditional_branches.get_index(index)
             {
@@ -1467,7 +1463,7 @@ impl PathQuery {
                 return None;
             }
 
-            if let Some(subquery_path) = &query.default_subquery_branch.subquery_path {
+            if let Some(subquery_path) = &query_node.default_subquery_branch.subquery_path {
                 if path_after_top_removed.len() <= subquery_path.len() {
                     if common_prefix_eq(path_after_top_removed, subquery_path) {
                         // The paths are equal for example if we had a sub path of
@@ -1477,13 +1473,14 @@ impl PathQuery {
                         // If we are asking what is the subquery when we are at 1 / 2
                         // we should get
                         return if path_after_top_removed.len() == subquery_path.len() {
-                            match &query.default_subquery_branch.subquery {
+                            match &query_node.default_subquery_branch.subquery {
                                 Some(subquery) => Some(SinglePathSubquery::from_query(subquery)),
                                 None => None,
                             }
                         } else {
                             let last_path_item = path.len() == subquery_path.len();
-                            let has_subquery = query.default_subquery_branch.subquery.is_some();
+                            let has_subquery =
+                                query_node.default_subquery_branch.subquery.is_some();
                             Some(SinglePathSubquery::from_key_when_in_path(
                                 &subquery_path[path_after_top_removed.len()],
                                 last_path_item,
@@ -1492,14 +1489,14 @@ impl PathQuery {
                         };
                     }
                 } else if common_prefix_eq(path_after_top_removed, subquery_path)
-                    && let Some(subquery) = &query.default_subquery_branch.subquery
+                    && let Some(subquery) = &query_node.default_subquery_branch.subquery
                 {
                     return recursive_query_items(
                         subquery,
                         &path_after_top_removed[subquery_path.len()..],
                     );
                 }
-            } else if let Some(subquery) = &query.default_subquery_branch.subquery {
+            } else if let Some(subquery) = &query_node.default_subquery_branch.subquery {
                 return recursive_query_items(subquery, path_after_top_removed);
             }
 
@@ -1615,6 +1612,18 @@ fn synthesized_in_path(
     } else {
         Some(Borrowed(key))
     }
+}
+
+/// The error for a count-offset paginated query whose item is a `Key`. A
+/// function of its own so the (non-ASCII) message stays out of the extracted
+/// model.
+#[cold]
+fn count_offset_key_unsupported() -> Error {
+    Error::InvalidQuery(
+        "count-offset paginated queries do not support QueryItem::Key — a \
+         single-key match has at most one in-range item, so offset > 0 is \
+         guaranteed to return zero items. Use a range variant instead",
+    )
 }
 
 /// Index of the first conditional subquery branch whose item contains
@@ -1824,23 +1833,23 @@ impl<'a> SinglePathSubquery<'a> {
         Self::from_query(&path_query.query.query)
     }
 
-    pub fn from_query(query: &Query) -> SinglePathSubquery<'_> {
-        let has_subquery = if query.default_subquery_branch.subquery.is_some()
-            || query.default_subquery_branch.subquery_path.is_some()
+    pub fn from_query(query_node: &Query) -> SinglePathSubquery<'_> {
+        let has_subquery = if query_node.default_subquery_branch.subquery.is_some()
+            || query_node.default_subquery_branch.subquery_path.is_some()
         {
             HasSubquery::Always
-        } else if let Some(conditional) = query.conditional_subquery_branches.as_ref() {
+        } else if let Some(conditional) = query_node.conditional_subquery_branches.as_ref() {
             HasSubquery::Conditionally(Cow::Borrowed(conditional))
         } else {
             HasSubquery::NoSubquery
         };
         SinglePathSubquery {
-            items: Cow::Borrowed(&query.items),
+            items: Cow::Borrowed(&query_node.items),
             has_subquery,
-            left_to_right: query.left_to_right,
+            left_to_right: query_node.left_to_right,
             in_path: None,
             synthesized_path_component: false,
-            instance_limit: query.limit,
+            instance_limit: query_node.limit,
         }
     }
 }

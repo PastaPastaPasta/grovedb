@@ -81,7 +81,7 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            return branches_have_aggregate_count_on_range(branches);
+            return branches_have_aggregate_count_on_range(branches, 0, branches.len());
         }
         false
     }
@@ -297,24 +297,35 @@ impl Query {
         subquery.validate_leaf_aggregate_count_on_range()
     }
 }
-/// Whether any conditional branch, in map order, has a subquery for which
-/// `Query::has_aggregate_count_on_range_anywhere` holds, stopping at the first that does. An index
-/// loop without an early return, so the stack stays constant in the number of
-/// branches (the recursion through `has_aggregate_count_on_range_anywhere` is bounded by the
-/// subquery depth).
-fn branches_have_aggregate_count_on_range(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
-    let mut found = false;
-    let mut i = 0;
-    while !found && i < branches.len() {
-        if let Some((_, branch)) = branches.get_index(i)
-            && let Some(sub) = branch.subquery.as_deref()
-        {
-            found = sub.has_aggregate_count_on_range_anywhere();
+
+/// Whether any conditional branch in `lo..hi`, in map order, has a subquery
+/// for which `Query::has_aggregate_count_on_range_anywhere` holds (`lo = 0`, `hi = branches.len()`
+/// for the whole map). The range is halved, left half first; the depth is
+/// `log2(hi - lo) + 1` per subquery level. Not a loop: a loop that calls back
+/// into `has_aggregate_count_on_range_anywhere` is mutually recursive with it, which the extracted
+/// model cannot define.
+fn branches_have_aggregate_count_on_range(
+    branches: &IndexMap<QueryItem, SubqueryBranch>,
+    lo: usize,
+    hi: usize,
+) -> bool {
+    if hi <= lo {
+        false
+    } else if hi - lo == 1 {
+        match branches.get_index(lo) {
+            Some((_, branch)) => match branch.subquery.as_deref() {
+                Some(sub) => sub.has_aggregate_count_on_range_anywhere(),
+                None => false,
+            },
+            None => false,
         }
-        i += 1;
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        branches_have_aggregate_count_on_range(branches, lo, mid)
+            || branches_have_aggregate_count_on_range(branches, mid, hi)
     }
-    found
 }
+
 /// The first item, in order, for which `QueryItem::is_aggregate_count_on_range` holds
 /// (`items.iter().find(..)`), as an index loop without a closure or an early
 /// return.

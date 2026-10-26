@@ -61,7 +61,7 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            return branches_have_aggregate_sum_on_range(branches);
+            return branches_have_aggregate_sum_on_range(branches, 0, branches.len());
         }
         false
     }
@@ -278,6 +278,7 @@ impl Query {
         subquery.validate_leaf_aggregate_sum_on_range()
     }
 }
+
 /// The first item, in order, for which `QueryItem::is_aggregate_sum_on_range` holds
 /// (`items.iter().find(..)`), as an index loop without a closure or an early
 /// return.
@@ -292,30 +293,41 @@ fn first_aggregate_sum_on_range(items: &[QueryItem]) -> Option<&QueryItem> {
         None
     }
 }
-/// Whether any conditional branch, in map order, has a selector tagged as the
-/// aggregate item or a subquery for which `Query::has_aggregate_sum_on_range_anywhere`
-/// holds (selector first), stopping at the first that does. An index loop
-/// without an early return, so the stack stays constant in the number of
-/// branches.
-fn branches_have_aggregate_sum_on_range(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
-    let mut found = false;
-    let mut i = 0;
-    while !found && i < branches.len() {
-        if let Some((selector, branch)) = branches.get_index(i) {
+
+/// Whether any conditional branch in `lo..hi`, in map order, has a selector
+/// tagged as the aggregate item or a subquery for which
+/// `Query::has_aggregate_sum_on_range_anywhere` holds (selector first). The range is halved,
+/// left half first; the depth is `log2(hi - lo) + 1` per subquery level. Not
+/// a loop: a loop that calls back into `has_aggregate_sum_on_range_anywhere` is mutually
+/// recursive with it, which the extracted model cannot define.
+fn branches_have_aggregate_sum_on_range(
+    branches: &IndexMap<QueryItem, SubqueryBranch>,
+    lo: usize,
+    hi: usize,
+) -> bool {
+    if hi <= lo {
+        false
+    } else if hi - lo == 1 {
+        match branches.get_index(lo) {
             // The selector is itself a `QueryItem` and could carry an
             // `AggregateSumOnRange` tag (the type permits it even
             // though it would not be a meaningful conditional
             // matcher). Reject defensively so a hidden ASOR in a
             // selector cannot slip past the aggregate-shape check.
-            if selector.is_aggregate_sum_on_range() {
-                found = true;
-            } else if let Some(sub) = branch.subquery.as_deref() {
-                found = sub.has_aggregate_sum_on_range_anywhere();
+            Some((selector, branch)) => {
+                selector.is_aggregate_sum_on_range()
+                    || match branch.subquery.as_deref() {
+                        Some(sub) => sub.has_aggregate_sum_on_range_anywhere(),
+                        None => false,
+                    }
             }
+            None => false,
         }
-        i += 1;
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        branches_have_aggregate_sum_on_range(branches, lo, mid)
+            || branches_have_aggregate_sum_on_range(branches, mid, hi)
     }
-    found
 }
 
 #[cfg(test)]

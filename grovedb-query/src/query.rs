@@ -390,7 +390,7 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            return branches_have_instance_limit(branches);
+            return branches_have_instance_limit(branches, 0, branches.len());
         }
         false
     }
@@ -408,46 +408,66 @@ impl Query {
             return true;
         }
         if let Some(branches) = &self.conditional_subquery_branches {
-            return branches_have_zero_instance_limit(branches);
+            return branches_have_zero_instance_limit(branches, 0, branches.len());
         }
         false
     }
 }
-/// Whether any conditional branch, in map order, has a subquery for which
-/// `Query::has_instance_limit_anywhere` holds, stopping at the first that does. An index
-/// loop without an early return, so the stack stays constant in the number of
-/// branches (the recursion through `has_instance_limit_anywhere` is bounded by the
-/// subquery depth).
-fn branches_have_instance_limit(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
-    let mut found = false;
-    let mut i = 0;
-    while !found && i < branches.len() {
-        if let Some((_, branch)) = branches.get_index(i)
-            && let Some(sub) = branch.subquery.as_deref()
-        {
-            found = sub.has_instance_limit_anywhere();
+
+/// Whether any conditional branch in `lo..hi`, in map order, has a subquery
+/// for which `Query::has_instance_limit_anywhere` holds (`lo = 0`, `hi = branches.len()`
+/// for the whole map). The range is halved, left half first; the depth is
+/// `log2(hi - lo) + 1` per subquery level. Not a loop: a loop that calls back
+/// into `has_instance_limit_anywhere` is mutually recursive with it, which the extracted
+/// model cannot define.
+fn branches_have_instance_limit(
+    branches: &IndexMap<QueryItem, SubqueryBranch>,
+    lo: usize,
+    hi: usize,
+) -> bool {
+    if hi <= lo {
+        false
+    } else if hi - lo == 1 {
+        match branches.get_index(lo) {
+            Some((_, branch)) => match branch.subquery.as_deref() {
+                Some(sub) => sub.has_instance_limit_anywhere(),
+                None => false,
+            },
+            None => false,
         }
-        i += 1;
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        branches_have_instance_limit(branches, lo, mid)
+            || branches_have_instance_limit(branches, mid, hi)
     }
-    found
 }
-/// Whether any conditional branch, in map order, has a subquery for which
-/// `Query::has_zero_instance_limit_anywhere` holds, stopping at the first that does. An index
-/// loop without an early return, so the stack stays constant in the number of
-/// branches (the recursion through `has_zero_instance_limit_anywhere` is bounded by the
-/// subquery depth).
-fn branches_have_zero_instance_limit(branches: &IndexMap<QueryItem, SubqueryBranch>) -> bool {
-    let mut found = false;
-    let mut i = 0;
-    while !found && i < branches.len() {
-        if let Some((_, branch)) = branches.get_index(i)
-            && let Some(sub) = branch.subquery.as_deref()
-        {
-            found = sub.has_zero_instance_limit_anywhere();
+
+/// Whether any conditional branch in `lo..hi`, in map order, has a subquery
+/// for which `Query::has_zero_instance_limit_anywhere` holds (`lo = 0`, `hi = branches.len()`
+/// for the whole map). The range is halved, left half first; the depth is
+/// `log2(hi - lo) + 1` per subquery level. Not a loop: a loop that calls back
+/// into `has_zero_instance_limit_anywhere` is mutually recursive with it, which the extracted
+/// model cannot define.
+fn branches_have_zero_instance_limit(
+    branches: &IndexMap<QueryItem, SubqueryBranch>,
+    lo: usize,
+    hi: usize,
+) -> bool {
+    if hi <= lo {
+        false
+    } else if hi - lo == 1 {
+        match branches.get_index(lo) {
+            Some((_, branch)) => match branch.subquery.as_deref() {
+                Some(sub) => sub.has_zero_instance_limit_anywhere(),
+                None => false,
+            },
+            None => false,
         }
-        i += 1;
+    } else {
+        let mid = lo + (hi - lo) / 2;
+        branches_have_zero_instance_limit(branches, lo, mid)
+            || branches_have_zero_instance_limit(branches, mid, hi)
     }
-    found
 }
 
 impl Query {
