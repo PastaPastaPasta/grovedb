@@ -284,6 +284,47 @@ fn charge_empty_v1_layer(limit_state: &mut super::V1LimitState, decrease_limit: 
     }
 }
 
+/// The `mmr_size` of an `MmrTree` element, or the error for an MMR proof
+/// attached to any other element. The element-kind checks of the non-Merk
+/// lower layers (`mmr_size_of`, `bulk_dims_of`, `dense_dims_of`) run before
+/// their proof decoding, in functions of their own, so the kind is decided
+/// by the authenticated element alone.
+fn mmr_size_of(element: &Element, path_query: &PathQuery) -> Result<u64, Error> {
+    match element {
+        Element::MmrTree(mmr_size, ..) => Ok(*mmr_size),
+        _ => Err(invalid_proof(
+            path_query,
+            "MMR proof attached to non-MmrTree element".to_string(),
+        )),
+    }
+}
+
+/// `(total_count, height, is_bulk_append)` of a `BulkAppendTree` or
+/// `CommitmentTree` element, or the error for a bulk proof attached to any
+/// other element.
+fn bulk_dims_of(element: &Element, path_query: &PathQuery) -> Result<(u64, u8, bool), Error> {
+    match element {
+        Element::BulkAppendTree(total_count, height, _) => Ok((*total_count, *height, true)),
+        Element::CommitmentTree(total_count, height, _) => Ok((*total_count, *height, false)),
+        _ => Err(invalid_proof(
+            path_query,
+            "BulkAppendTree proof attached to incompatible element".to_string(),
+        )),
+    }
+}
+
+/// `(count, height)` of a `DenseAppendOnlyFixedSizeTree` element, or the
+/// error for a dense proof attached to any other element.
+fn dense_dims_of(element: &Element, path_query: &PathQuery) -> Result<(u16, u8), Error> {
+    match element {
+        Element::DenseAppendOnlyFixedSizeTree(count, height, _) => Ok((*count, *height)),
+        _ => Err(invalid_proof(
+            path_query,
+            "DenseTree proof attached to non-DenseTree element".to_string(),
+        )),
+    }
+}
+
 /// Where a V1 walk puts the rows it verifies.
 ///
 /// `push_row` converts the row exactly as the matching
@@ -3260,7 +3301,8 @@ impl GroveDb {
         report_contents: bool,
         grove_version: &GroveVersion,
     ) -> Result<(), Error> {
-        match Self::mmr_lower_root(mmr_bytes, element, query)? {
+        let element_mmr_size = mmr_size_of(element, query)?;
+        match Self::mmr_lower_root(mmr_bytes, element_mmr_size, query)? {
             // An empty MMR (mmr_size == 0) has no leaves to verify: its root
             // is the empty-MMR root hash ([0u8; 32]).
             MmrLowerRoot::Empty => parent.bind(query, &[0u8; 32]),
@@ -3295,25 +3337,14 @@ impl GroveDb {
     }
 
     /// Decode an MMR lower layer proof, check it against the element's
-    /// `mmr_size`, and compute its root. Reads neither the result set nor
+    /// `mmr_size` (`mmr_size_of`), and compute its root. Reads neither the result set nor
     /// the row limit; the caller binds the root before anything is
     /// reported.
     fn mmr_lower_root(
         mmr_bytes: &[u8],
-        element: &Element,
+        element_mmr_size: u64,
         query: &PathQuery,
     ) -> Result<MmrLowerRoot, Error> {
-        // Extract the MMR size from the element
-        let element_mmr_size = match element {
-            Element::MmrTree(mmr_size, ..) => *mmr_size,
-            _ => {
-                return Err(invalid_proof(
-                    query,
-                    "MMR proof attached to non-MmrTree element".to_string(),
-                ));
-            }
-        };
-
         let mmr_proof = grovedb_merkle_mountain_range::MmrTreeProof::decode_from_slice(mmr_bytes)
             .map_err(|e| Error::CorruptedData(format!("{}", e)))?;
 
@@ -3464,8 +3495,14 @@ impl GroveDb {
         report_contents: bool,
         grove_version: &GroveVersion,
     ) -> Result<(), Error> {
-        let (child_hash, proof_result) =
-            Self::decode_bulk_append_lower_layer(bulk_bytes, element, query)?;
+        let (total_count, height, is_bulk_append) = bulk_dims_of(element, query)?;
+        let (child_hash, proof_result) = Self::decode_bulk_append_lower_layer(
+            bulk_bytes,
+            total_count,
+            height,
+            is_bulk_append,
+            query,
+        )?;
         parent.bind(query, &child_hash)?;
         if report_contents {
             Self::report_bulk_append_entries(
@@ -3482,11 +3519,14 @@ impl GroveDb {
 
     /// Decode a `BulkAppendTree` / `CommitmentTree` bulk proof and check its
     /// internal consistency against the element's `total_count` and
-    /// `height`. Returns the bulk child hash and the verified proof result,
-    /// from which nothing has been extracted yet.
+    /// `height` (`bulk_dims_of`; `is_bulk_append` for a `BulkAppendTree`).
+    /// Returns the bulk child hash and the verified proof result, from which
+    /// nothing has been extracted yet.
     fn decode_bulk_append_lower_layer(
         bulk_bytes: &[u8],
-        element: &Element,
+        element_total_count: u64,
+        element_height: u8,
+        is_bulk_append: bool,
         query: &PathQuery,
     ) -> Result<
         (
@@ -3495,17 +3535,6 @@ impl GroveDb {
         ),
         Error,
     > {
-        let (element_total_count, element_height) = match element {
-            Element::BulkAppendTree(total_count, height, _) => (*total_count, *height),
-            Element::CommitmentTree(total_count, height, _) => (*total_count, *height),
-            _ => {
-                return Err(invalid_proof(
-                    query,
-                    "BulkAppendTree proof attached to incompatible element".to_string(),
-                ));
-            }
-        };
-
         let bulk_proof =
             grovedb_bulk_append_tree::BulkAppendTreeProof::decode_from_slice(bulk_bytes)
                 .map_err(|e| Error::CorruptedData(format!("{}", e)))?;
@@ -3523,12 +3552,11 @@ impl GroveDb {
         // different — its insert commits `EMPTY_COMMITMENT_TREE_STATE_ROOT`,
         // which folds in the *computed* empty bulk root, so the CT wrapper
         // keeps the computed value.
-        let child_hash =
-            if element_total_count == 0 && matches!(element, Element::BulkAppendTree(..)) {
-                NULL_HASH
-            } else {
-                bulk_state_root
-            };
+        let child_hash = if element_total_count == 0 && is_bulk_append {
+            NULL_HASH
+        } else {
+            bulk_state_root
+        };
         Ok((child_hash, proof_result))
     }
 
@@ -3663,8 +3691,14 @@ impl GroveDb {
         let bulk_proof_bytes = &ct_bytes[32..];
 
         // Verify the bulk append proof to get bulk_state_root
-        let (bulk_state_root, proof_result) =
-            Self::decode_bulk_append_lower_layer(bulk_proof_bytes, element, query)?;
+        let (total_count, height, is_bulk_append) = bulk_dims_of(element, query)?;
+        let (bulk_state_root, proof_result) = Self::decode_bulk_append_lower_layer(
+            bulk_proof_bytes,
+            total_count,
+            height,
+            is_bulk_append,
+            query,
+        )?;
 
         // Combine sinsemilla_root with bulk_state_root to produce the
         // child hash the parent row commits to.
@@ -3710,9 +3744,11 @@ impl GroveDb {
         report_contents: bool,
         grove_version: &GroveVersion,
     ) -> Result<(), Error> {
+        let (element_count, element_height) = dense_dims_of(element, query)?;
         match Self::dense_lower_root(
             dense_bytes,
-            element,
+            element_count,
+            element_height,
             path,
             query,
             report_contents,
@@ -3737,7 +3773,8 @@ impl GroveDb {
         }
     }
 
-    /// Decode a dense lower layer proof and compute its root. When
+    /// Decode a dense lower layer proof (against the element's count and
+    /// height, `dense_dims_of`) and compute its root. When
     /// `report_contents` is set, also check it against the query at `path`
     /// (completeness and soundness) and return the selected entries; the
     /// root computation differs between the two modes. Reads neither the
@@ -3745,23 +3782,13 @@ impl GroveDb {
     /// anything is reported.
     fn dense_lower_root(
         dense_bytes: &[u8],
-        element: &Element,
+        element_count: u16,
+        element_height: u8,
         path: &[&[u8]],
         query: &PathQuery,
         report_contents: bool,
         grove_version: &GroveVersion,
     ) -> Result<DenseLowerRoot, Error> {
-        // Extract the count and height from the authenticated element
-        let (element_count, element_height) = match element {
-            Element::DenseAppendOnlyFixedSizeTree(count, height, _) => (*count, *height),
-            _ => {
-                return Err(invalid_proof(
-                    query,
-                    "DenseTree proof attached to non-DenseTree element".to_string(),
-                ));
-            }
-        };
-
         let dense_proof =
             grovedb_dense_fixed_sized_merkle_tree::DenseTreeProof::decode_from_slice(dense_bytes)
                 .map_err(|e| Error::CorruptedData(format!("{}", e)))?;
