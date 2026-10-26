@@ -237,8 +237,6 @@ impl QueryProofVerify for Query {
             output: Vec::with_capacity(self.len()),
         };
 
-        let mut decoder = Decoder::new(bytes);
-
         // Issue #863: the stream must be encoded in the op family of the
         // direction it is walked in, and in that family only.
         //
@@ -261,20 +259,22 @@ impl QueryProofVerify for Query {
         // Enforced for V1 proofs only: V0 is a locked wire format whose
         // verifier is not to change, and it is gated at `proof_version`
         // like the other V1-only strictness checks in this function.
-        let oriented_ops = OrientedOps {
-            decoder: &mut decoder,
+        let mut oriented_ops = OrientedOps {
+            decoder: Decoder::new(bytes),
             proof_version,
             left_to_right,
         };
 
-        let root_wrapped = execute(oriented_ops, true, |node| walk.visit(&self.items, node));
+        let root_wrapped = execute(&mut oriented_ops, true, |node| {
+            walk.visit(&self.items, node)
+        });
 
         let root = cost_return_on_error!(&mut cost, root_wrapped);
 
-        if decoder.remaining_bytes() > 0 {
+        if oriented_ops.decoder.remaining_bytes() > 0 {
             return Err(Error::InvalidProofError(format!(
                 "Proof has {} unconsumed trailing bytes",
-                decoder.remaining_bytes()
+                oriented_ops.decoder.remaining_bytes()
             )))
             .wrap_with_cost(cost);
         }
@@ -940,13 +940,13 @@ fn past_item_end(query_item: &QueryItem, key: &[u8], left_to_right: bool) -> boo
 
 /// The proof's ops, checked to be in the op family of the walk direction
 /// (issue #863; see [`QueryProofVerify::execute_proof_with_limit_mode`]).
-struct OrientedOps<'a, 'b> {
-    decoder: &'b mut Decoder<'a>,
+struct OrientedOps<'a> {
+    decoder: Decoder<'a>,
     proof_version: u16,
     left_to_right: bool,
 }
 
-impl Iterator for OrientedOps<'_, '_> {
+impl Iterator for OrientedOps<'_> {
     type Item = Result<Op, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
