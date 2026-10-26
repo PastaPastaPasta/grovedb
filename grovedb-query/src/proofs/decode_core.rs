@@ -1264,6 +1264,115 @@ mod tests {
         assert!(decoder.next().is_none());
     }
 
+    /// The decoder loop as it was before `next_core`: `Op::decode` on the
+    /// remaining bytes, advancing by `ed`'s `encoding_length`.
+    fn reference_decoder(bytes: &[u8]) -> Vec<(Result<Op, String>, usize)> {
+        let mut out = vec![];
+        let mut offset = 0usize;
+        let mut failed = false;
+        while !failed && offset < bytes.len() {
+            match Op::decode(&bytes[offset..]) {
+                Ok(op) => {
+                    offset += <Op as Encode>::encoding_length(&op).unwrap();
+                    out.push((Ok(op), bytes.len().saturating_sub(offset)));
+                }
+                Err(e) => {
+                    failed = true;
+                    out.push((Err(e.to_string()), bytes.len().saturating_sub(offset)));
+                }
+            }
+        }
+        out
+    }
+
+    fn check_decoder(bytes: &[u8]) {
+        use crate::proofs::Decoder;
+        let expected = reference_decoder(bytes);
+        let mut decoder = Decoder::new(bytes);
+        let mut core_decoder = Decoder::new(bytes);
+        for (item, remaining) in &expected {
+            let got = decoder.next().expect("item expected");
+            let got_core = core_decoder.next_core().expect("core item expected");
+            match (item, &got, &got_core) {
+                (Ok(a), Ok(b), Ok(c)) => {
+                    assert_eq!(a, b);
+                    assert_eq!(a, c);
+                }
+                (Err(a), Err(b), Err(c)) => {
+                    assert_eq!(a, &b.to_string());
+                    assert_eq!(
+                        a,
+                        &format!(
+                            "invalid proof error {}",
+                            crate::proofs::op_decode_error_message(c)
+                        )
+                    );
+                }
+                _ => panic!("decoder mismatch on {bytes:02x?}"),
+            }
+            assert_eq!(*remaining, decoder.remaining_bytes(), "on {bytes:02x?}");
+            assert_eq!(*remaining, core_decoder.remaining_bytes());
+        }
+        // Fused: exhausted after the last item (end of input or one error).
+        for _ in 0..3 {
+            assert!(decoder.next().is_none());
+            assert!(core_decoder.next_core().is_none());
+        }
+    }
+
+    #[test]
+    fn decoder_matches_reference_loop() {
+        let corpus: Vec<Vec<u8>> = corpus().into_iter().filter(|b| b.len() < 2000).collect();
+        // Valid streams: consecutive encodings.
+        let mut stream = vec![];
+        for chunk in &corpus {
+            stream.extend_from_slice(chunk);
+        }
+        check_decoder(&stream);
+        // A stream with a 6-byte-header (u32 length) op in the middle.
+        let big = encode(&Op::Push(Node::KV(vec![1], vec![9u8; 65536])));
+        let mut with_big = encode(&Op::Parent);
+        with_big.extend_from_slice(&big);
+        with_big.extend_from_slice(&encode(&Op::Child));
+        check_decoder(&with_big);
+        check_decoder(&with_big[..with_big.len() - 1]);
+        for end in [0usize, 1, 7, 100, stream.len() / 2, stream.len() - 1] {
+            check_decoder(&stream[..end]);
+        }
+        // Individual encodings with trailing/mutated bytes, plus
+        // non-canonical ones (offset undershoot) followed by more ops.
+        let mut rng = Rng(0x0dec_0de5);
+        for _ in 0..3_000 {
+            let mut bytes = vec![];
+            let parts = 1 + rng.next() % 4;
+            for _ in 0..parts {
+                bytes.extend_from_slice(&corpus[(rng.next() as usize) % corpus.len()]);
+            }
+            let flips = rng.next() % 3;
+            for _ in 0..flips {
+                let pos = (rng.next() as usize) % bytes.len();
+                bytes[pos] = rng.next() as u8;
+            }
+            if rng.next().is_multiple_of(3) {
+                let cut = (rng.next() as usize) % bytes.len();
+                bytes.truncate(cut);
+            }
+            check_decoder(&bytes);
+        }
+        for _ in 0..3_000 {
+            let len = (rng.next() % 120) as usize;
+            let bytes: Vec<u8> = (0..len).map(|_| rng.next() as u8).collect();
+            check_decoder(&bytes);
+        }
+        // Non-canonical encodings followed by more ops.
+        check_decoder(&[0x20, 1, 0xaa, 0, 0, 0, 3, 1, 2, 3, 0x10, 0x10, 0x11]);
+        check_decoder(&[0x51, 0, 0, 0, 0, 0]);
+        let mut padded = vec![0x07, 0, 0, 0];
+        padded.extend_from_slice(&[5u8; 32]);
+        padded.extend_from_slice(&[3, 0x80, 0x00, 0x10, 0x11, 0x10]);
+        check_decoder(&padded);
+    }
+
     #[test]
     fn wrapper_error_strings_are_unchanged() {
         let cases: Vec<(Vec<u8>, &str)> = vec![

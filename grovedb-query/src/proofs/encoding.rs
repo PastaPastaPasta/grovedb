@@ -5,7 +5,8 @@ use std::io::{Read, Write};
 use ed::{Decode, Encode, Error as EdError, Terminated};
 
 use super::{
-    decode_core::{decode_op, OpDecodeError, MAX_VALUE_LEN},
+    decode_core::{decode_op, decode_op_at, Cursor, OpDecodeError, MAX_VALUE_LEN},
+    encode_core::op_encoding_length,
     Node, Op,
 };
 use crate::{
@@ -1969,8 +1970,15 @@ impl Op {
     }
 
     /// Get the encoding length of this Op
+    ///
+    /// Computed by [`op_encoding_length`], which returns exactly what
+    /// `<Op as ed::Encode>::encoding_length` does. That method is infallible
+    /// for every `Op` (all its `Ok(..)` paths are unconditional: fixed-width
+    /// integers, hashes, and `TreeFeatureType::encoding_length`), so the
+    /// `expect` this used to carry could never fire and there is no panic
+    /// behavior to preserve.
     pub fn encoding_length(&self) -> usize {
-        Encode::encoding_length(self).expect("encoding length should not fail")
+        op_encoding_length(self)
     }
 
     /// Decode an Op from bytes
@@ -1980,19 +1988,7 @@ impl Op {
     pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
         let result = match decode_op(bytes) {
             Ok(op) => Ok(op),
-            Err(OpDecodeError::UnexpectedByte(byte)) => Err(Error::InvalidProofError(format!(
-                "failed to decode an proofs::Op structure (UnexpectedByte: {byte})"
-            ))),
-            Err(OpDecodeError::UnexpectedEof) => Err(Error::InvalidProofError(
-                "failed to decode an proofs::Op structure (failed to fill whole buffer)"
-                    .to_string(),
-            )),
-            Err(OpDecodeError::TruncatedVarint) => Err(Error::InvalidProofError(
-                "failed to decode an proofs::Op structure (Reached EOF)".to_string(),
-            )),
-            Err(OpDecodeError::UnterminatedVarint) => Err(Error::InvalidProofError(
-                "failed to decode an proofs::Op structure (Unterminated varint)".to_string(),
-            )),
+            Err(e) => Err(Error::InvalidProofError(op_decode_error_message(&e))),
         };
         // In test builds, cross-check every decode against the original
         // `ed::Decode` implementation (value, accept/reject, error string).
@@ -2016,6 +2012,28 @@ impl Op {
             }
         }
         result
+    }
+}
+
+/// The message `Op::decode` and [`Decoder`] report for a decoding failure,
+/// identical to what the `ed::Decode` based decoder produced.
+///
+/// This is the only place decode errors are formatted; the decoding core
+/// ([`decode_op`], [`Decoder::next_core`]) carries a plain [`OpDecodeError`].
+pub fn op_decode_error_message(error: &OpDecodeError) -> String {
+    match error {
+        OpDecodeError::UnexpectedByte(byte) => {
+            format!("failed to decode an proofs::Op structure (UnexpectedByte: {byte})")
+        }
+        OpDecodeError::UnexpectedEof => {
+            "failed to decode an proofs::Op structure (failed to fill whole buffer)".to_string()
+        }
+        OpDecodeError::TruncatedVarint => {
+            "failed to decode an proofs::Op structure (Reached EOF)".to_string()
+        }
+        OpDecodeError::UnterminatedVarint => {
+            "failed to decode an proofs::Op structure (Unterminated varint)".to_string()
+        }
     }
 }
 
@@ -2057,22 +2075,45 @@ impl<'a> Decoder<'a> {
     pub const fn remaining_bytes(&self) -> usize {
         self.bytes.len().saturating_sub(self.offset)
     }
+
+    /// Decode the next operator, reporting failures as a plain
+    /// [`OpDecodeError`]. This is the pure core of the [`Iterator`]
+    /// implementation.
+    ///
+    /// After a successful decode the offset advances by the operator's
+    /// canonical encoded length ([`op_encoding_length`]), not by the number of
+    /// bytes actually read; after a failure no more items are produced and
+    /// the offset stays put.
+    pub fn next_core(&mut self) -> Option<Result<Op, OpDecodeError>> {
+        if self.failed || self.offset >= self.bytes.len() {
+            return None;
+        }
+
+        let mut cursor = Cursor::new(&self.bytes[self.offset..]);
+        match decode_op_at(&mut cursor) {
+            Ok(op) => {
+                self.offset += op_encoding_length(&op);
+                Some(Ok(op))
+            }
+            Err(error) => {
+                self.failed = true;
+                Some(Err(error))
+            }
+        }
+    }
 }
 
 impl Iterator for Decoder<'_> {
     type Item = Result<Op, Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.failed || self.offset >= self.bytes.len() {
-            return None;
+        match self.next_core() {
+            None => None,
+            Some(Ok(op)) => Some(Ok(op)),
+            Some(Err(error)) => Some(Err(Error::InvalidProofError(op_decode_error_message(
+                &error,
+            )))),
         }
-
-        let result = Op::decode(&self.bytes[self.offset..]);
-        match &result {
-            Ok(op) => self.offset += op.encoding_length(),
-            Err(_) => self.failed = true,
-        }
-        Some(result)
     }
 }
 

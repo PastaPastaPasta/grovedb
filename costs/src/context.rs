@@ -132,8 +132,7 @@ impl<T, E> CostResult<Result<T, E>, E> {
     pub fn flatten(self) -> CostResult<T, E> {
         self.map(|value| match value {
             Err(e) => Err(e),
-            Ok(Err(e)) => Err(e),
-            Ok(Ok(v)) => Ok(v),
+            Ok(inner) => inner,
         })
     }
 }

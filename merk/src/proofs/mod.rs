@@ -53,10 +53,12 @@ impl Iterator for Decoder<'_> {
     type Item = Result<Op, crate::error::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next() {
+        match self.inner.next_core() {
             None => None,
             Some(Ok(op)) => Some(Ok(op)),
-            Some(Err(error)) => Some(Err(error.into())),
+            Some(Err(error)) => Some(Err(crate::error::Error::InvalidProofError(
+                grovedb_query::proofs::op_decode_error_message(&error),
+            ))),
         }
     }
 }
@@ -89,6 +91,27 @@ mod tests {
         for _ in 0..3 {
             assert!(decoder.next().is_none());
             assert_eq!(decoder.remaining_bytes(), 2);
+        }
+    }
+
+    #[test]
+    fn decoder_error_is_invalid_proof_error_with_old_message() {
+        for (bytes, message) in [
+            (
+                vec![0xFFu8],
+                "failed to decode an proofs::Op structure (UnexpectedByte: 255)",
+            ),
+            (
+                vec![0x01u8, 0x00],
+                "failed to decode an proofs::Op structure (failed to fill whole buffer)",
+            ),
+        ] {
+            let mut decoder = Decoder::new(&bytes);
+            match decoder.next() {
+                Some(Err(crate::error::Error::InvalidProofError(s))) => assert_eq!(s, message),
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(decoder.next().is_none());
         }
     }
 }

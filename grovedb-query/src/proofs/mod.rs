@@ -4,12 +4,14 @@
 //! and verify Merkle proofs in GroveDB/Merk.
 
 pub mod decode_core;
+pub mod encode_core;
 mod encoding;
 
 mod tree_feature_type;
 
 pub use decode_core::{decode_op, OpDecodeError};
-pub use encoding::{encode_into, Decoder};
+pub use encode_core::op_encoding_length;
+pub use encoding::{encode_into, op_decode_error_message, Decoder};
 pub use tree_feature_type::{NodeType, TreeFeatureType};
 
 use crate::hex_to_ascii;
