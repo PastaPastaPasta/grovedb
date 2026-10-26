@@ -6,7 +6,8 @@ use grovedb_merk::{
     proofs::{
         execute,
         query::{
-            PathKey, ProvedKeyOptionalValue, QueryProofVerify, VerifyOptions, PROOF_VERSION_LATEST,
+            PathKey, ProvedKeyOptionalValue, QueryProofVerify, SumBudgetRead, VerifyOptions,
+            PROOF_VERSION_LATEST,
         },
         Decoder, Node, Op, Query,
     },
@@ -1438,6 +1439,10 @@ impl GroveDb {
     /// proof's reconstructed root hash, which the surrounding walk
     /// binds through the ordinary `combine_hash(H(value), child_root)`
     /// parent check.
+    ///
+    /// `sum_budget_window_gate` runs first and returns the budget read the
+    /// query asks for at `path`; only then does `sum_budget_window_body`
+    /// decode and replay the window.
     fn verify_sum_budget_window_layer(
         payload_bytes: &[u8],
         path: &[&[u8]],
@@ -1445,8 +1450,25 @@ impl GroveDb {
         query: &PathQuery,
         grove_version: &GroveVersion,
     ) -> Result<CryptoHash, Error> {
-        use crate::operations::proof::SumBudgetWindowProof;
+        let budget = Self::sum_budget_window_gate(path, query, grove_version)?;
+        Self::sum_budget_window_body(
+            budget,
+            payload_bytes,
+            path,
+            axis_outcomes,
+            query,
+            grove_version,
+        )
+    }
 
+    /// The acceptance gate of a sum-budget window layer: the grove version
+    /// must accept sum-budget windows in the V1 envelope, and the query
+    /// node at `path` must be a sum-budget read, whose budget is returned.
+    fn sum_budget_window_gate(
+        path: &[&[u8]],
+        query: &PathQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<SumBudgetRead, Error> {
         // Envelope gate: sum-budget windows are a V4 acceptance rule.
         if grove_version
             .grovedb_versions
@@ -1469,6 +1491,23 @@ impl GroveDb {
                     .to_string(),
             ));
         };
+        Ok(budget)
+    }
+
+    /// The body of a sum-budget window layer, run after
+    /// `sum_budget_window_gate` accepted it with `budget`: decode the
+    /// window, execute its Merk proof, replay the budget fold, record the
+    /// outcome in `axis_outcomes`, and return the window root.
+    fn sum_budget_window_body(
+        budget: SumBudgetRead,
+        payload_bytes: &[u8],
+        path: &[&[u8]],
+        axis_outcomes: &mut Vec<AxisWalkOutcome>,
+        query: &PathQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<CryptoHash, Error> {
+        use crate::operations::proof::SumBudgetWindowProof;
+
         let node = &query.query.query;
 
         let payload = SumBudgetWindowProof::decode_canonical(payload_bytes)?;
