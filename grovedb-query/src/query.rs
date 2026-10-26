@@ -417,7 +417,7 @@ impl Query {
 /// Whether any conditional branch in `lo..hi`, in map order, has a subquery
 /// for which `Query::has_instance_limit_anywhere` holds (`lo = 0`, `hi = branches.len()`
 /// for the whole map). The range is halved, left half first; the depth is
-/// `log2(hi - lo) + 1` per subquery level. Not a loop: a loop that calls back
+/// `ceil(log2(hi - lo)) + 1` per subquery level. Not a loop: a loop that calls back
 /// into `has_instance_limit_anywhere` is mutually recursive with it, which the extracted
 /// model cannot define.
 fn branches_have_instance_limit(
@@ -445,7 +445,7 @@ fn branches_have_instance_limit(
 /// Whether any conditional branch in `lo..hi`, in map order, has a subquery
 /// for which `Query::has_zero_instance_limit_anywhere` holds (`lo = 0`, `hi = branches.len()`
 /// for the whole map). The range is halved, left half first; the depth is
-/// `log2(hi - lo) + 1` per subquery level. Not a loop: a loop that calls back
+/// `ceil(log2(hi - lo)) + 1` per subquery level. Not a loop: a loop that calls back
 /// into `has_zero_instance_limit_anywhere` is mutually recursive with it, which the extracted
 /// model cannot define.
 fn branches_have_zero_instance_limit(

@@ -297,7 +297,7 @@ fn first_aggregate_sum_on_range(items: &[QueryItem]) -> Option<&QueryItem> {
 /// Whether any conditional branch in `lo..hi`, in map order, has a selector
 /// tagged as the aggregate item or a subquery for which
 /// `Query::has_aggregate_sum_on_range_anywhere` holds (selector first). The range is halved,
-/// left half first; the depth is `log2(hi - lo) + 1` per subquery level. Not
+/// left half first; the depth is `ceil(log2(hi - lo)) + 1` per subquery level. Not
 /// a loop: a loop that calls back into `has_aggregate_sum_on_range_anywhere` is mutually
 /// recursive with it, which the extracted model cannot define.
 fn branches_have_aggregate_sum_on_range(

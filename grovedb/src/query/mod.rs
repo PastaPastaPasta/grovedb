@@ -1338,7 +1338,7 @@ impl PathQuery {
     /// function, so they cannot disagree about which layers carry read
     /// modes.
     fn read_mode_at_path(&self, path: &[&[u8]]) -> Option<&ReadMode> {
-        /// Resolve the query NODE at exactly `path` below `query`,
+        /// Resolve the query NODE at exactly `path` below `query_node`,
         /// following conditional and default subquery branches the same
         /// way `query_items_at_path`'s resolver does — but returning
         /// the node itself rather than its per-layer view, and `None`

@@ -301,7 +301,7 @@ impl Query {
 /// Whether any conditional branch in `lo..hi`, in map order, has a subquery
 /// for which `Query::has_aggregate_count_on_range_anywhere` holds (`lo = 0`, `hi = branches.len()`
 /// for the whole map). The range is halved, left half first; the depth is
-/// `log2(hi - lo) + 1` per subquery level. Not a loop: a loop that calls back
+/// `ceil(log2(hi - lo)) + 1` per subquery level. Not a loop: a loop that calls back
 /// into `has_aggregate_count_on_range_anywhere` is mutually recursive with it, which the extracted
 /// model cannot define.
 fn branches_have_aggregate_count_on_range(
