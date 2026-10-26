@@ -833,6 +833,52 @@ mod tests {
         compare_result_sets(&elements, &result_set);
     }
 
+    /// The limit runs out inside the first subtree of a layer with more
+    /// rows left: the V1 row walk stops at that row (`RowFlow::Break`) and
+    /// visits none of the remaining parent rows.
+    #[test]
+    fn test_range_subquery_limit_exhausted_in_first_subtree() {
+        let grove_version = GroveVersion::latest();
+        let db = make_test_grovedb(grove_version);
+        populate_tree_for_non_unique_range_subquery(&db, grove_version);
+
+        let path = vec![TEST_LEAF.to_vec()];
+        let mut query = Query::new();
+        query.insert_all();
+        let mut subquery = Query::new();
+        subquery.insert_all();
+        query.set_subquery_key(b"\0".to_vec());
+        query.set_subquery(subquery);
+
+        let path_query = PathQuery::new(path, SizedQuery::new(query, Some(5), None));
+
+        let (elements, _) = db
+            .query_item_value(&path_query, true, true, true, None, grove_version)
+            .unwrap()
+            .expect("expected successful get_path_query");
+        let expected: Vec<Vec<u8>> = (100_u32..105)
+            .map(|j| {
+                let mut value = 1985_u32.to_be_bytes().to_vec();
+                value.extend_from_slice(&j.to_be_bytes());
+                value
+            })
+            .collect();
+        assert_eq!(elements, expected);
+
+        let proof = db
+            .prove_query(&path_query, None, grove_version)
+            .unwrap()
+            .unwrap();
+        let root_hash = db.root_hash(None, grove_version).unwrap().unwrap();
+        let (hash, result_set) =
+            GroveDb::verify_query_raw(&proof, &path_query, grove_version).unwrap();
+        assert_eq!(hash, root_hash);
+        compare_result_sets(&elements, &result_set);
+        let (hash, result_set) = GroveDb::verify_query(&proof, &path_query, grove_version).unwrap();
+        assert_eq!(hash, root_hash);
+        assert_eq!(result_set.len(), 5);
+    }
+
     #[test]
     fn test_get_range_query_with_unique_subquery() {
         let grove_version = GroveVersion::latest();

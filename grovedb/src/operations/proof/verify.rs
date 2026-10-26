@@ -190,8 +190,9 @@ fn path_to_owned(path: &[&[u8]]) -> Vec<Vec<u8>> {
 }
 
 /// Push `path[i..]` onto `owned`, in order. Recursive rather than a loop; the
-/// depth is `path.len() - i`, and a V1 layer path is at most one component
-/// per proof level (`MAX_PROOF_DEPTH`).
+/// depth is `path.len() - i`, and the paths passed here are a V1 layer path
+/// (at most one component per proof level, `MAX_PROOF_DEPTH`) plus at most
+/// two keys.
 fn push_owned_components(path: &[&[u8]], i: usize, owned: &mut Vec<Vec<u8>>) {
     if i < path.len() {
         owned.push(path[i].to_vec());
@@ -2086,7 +2087,9 @@ impl GroveDb {
     /// in exactly the order and with exactly the early exits of
     /// `for row in rows { match verify_v1_row(row)? { Break => break, .. } }`.
     /// Recursion rather than a loop; halving keeps the depth at
-    /// `log2(hi - lo) + 1`.
+    /// `log2(hi - lo) + 1`. Those frames stay live while a row descends to
+    /// its lower layer, so a proof `d` levels deep adds up to `d` times that
+    /// to the stack (`d <= MAX_PROOF_DEPTH`).
     #[allow(clippy::too_many_arguments)]
     fn verify_v1_rows<S: RowSink>(
         ctx: V1LayerCtx<'_>,
