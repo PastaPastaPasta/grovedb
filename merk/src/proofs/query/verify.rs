@@ -202,7 +202,7 @@ impl QueryProofVerify for Query {
         left_to_right: bool,
         proof_version: u16,
     ) -> CostResult<(MerkHash, ProofVerificationResult), Error> {
-        if limit_mode == ProofLimitMode::UpperBound && proof_version < 1 {
+        if upper_bound_unsupported(limit_mode, proof_version) {
             return Err(Error::InvalidProofError(
                 "upper-bound limit verification requires proof version 1 or later".to_string(),
             ))
@@ -284,34 +284,10 @@ impl QueryProofVerify for Query {
             .wrap_with_cost(cost);
         }
 
-        // we have remaining query items, check absence proof against right edge of
-        // tree
-        if walk.peek(&self.items).is_some() {
-            if walk.current_limit == Some(0) || walk.stopped_early {
-            } else {
-                if is_bound_witness(&walk.last_push) {
-                    // last node in tree was less than queried item
-                } else if walk.limit_mode == ProofLimitMode::UpperBound && !walk.output.is_empty() {
-                    // Upper-bound mode: the prover stopped after the results so
-                    // far and hid the rest; the remaining items are unproven.
-                    walk.stopped_early = true;
-                } else {
-                    // proof contains abridged data so we cannot verify absence of
-                    // remaining query items
-                    return Err(Error::InvalidProofError(
-                        "Proof is missing data for query".to_string(),
-                    ))
-                    .wrap_with_cost(cost);
-                }
-            }
-        }
-
-        // Whether the proof shows nothing further matches: true unless the walk
-        // stopped (at the limit, or early in upper-bound mode) with query items
-        // left. When items were left and it is true, the absence check above
-        // proved them.
-        let exhausted = !walk.stopped_early
-            && (walk.peek(&self.items).is_none() || walk.current_limit != Some(0));
+        let exhausted = match walk.finish(&self.items) {
+            Ok(exhausted) => exhausted,
+            Err(e) => return Err(e).wrap_with_cost(cost),
+        };
 
         Ok((
             root.hash().unwrap_add_cost(&mut cost),
@@ -448,6 +424,35 @@ impl QueryWalk {
             // continue to next queried item
         }
         Ok(())
+    }
+
+    /// The checks after the proof is executed. Query items left over must be
+    /// proven absent: the walk stopped at the limit (or early in upper-bound
+    /// mode), or the last push revealed a key, so nothing lies to its right
+    /// (left, walking backwards). Returns whether the proof shows nothing
+    /// further matches: true unless the walk stopped (at the limit, or early
+    /// in upper-bound mode) with query items left. When items were left and
+    /// it is true, the absence check proved them.
+    fn finish(&mut self, items: &[QueryItem]) -> Result<bool, Error> {
+        // we have remaining query items, check absence proof against right edge of
+        // tree
+        if self.peek(items).is_some() {
+            if self.current_limit == Some(0) || self.stopped_early {
+            } else if is_bound_witness(&self.last_push) {
+                // last node in tree was less than queried item
+            } else if self.limit_mode == ProofLimitMode::UpperBound && !self.output.is_empty() {
+                // Upper-bound mode: the prover stopped after the results so
+                // far and hid the rest; the remaining items are unproven.
+                self.stopped_early = true;
+            } else {
+                // proof contains abridged data so we cannot verify absence of
+                // remaining query items
+                return Err(Error::InvalidProofError(
+                    "Proof is missing data for query".to_string(),
+                ));
+            }
+        }
+        Ok(!self.stopped_early && (self.peek(items).is_none() || self.current_limit != Some(0)))
     }
 
     /// The first key the walk meets for `query_item` must prove the start of
@@ -895,6 +900,11 @@ impl QueryWalk {
 
         Ok(())
     }
+}
+
+/// Upper-bound limit verification needs a V1 or later proof.
+fn upper_bound_unsupported(limit_mode: ProofLimitMode, proof_version: u16) -> bool {
+    limit_mode == ProofLimitMode::UpperBound && proof_version < 1
 }
 
 /// The element type carries backward references, so its value hash is a
