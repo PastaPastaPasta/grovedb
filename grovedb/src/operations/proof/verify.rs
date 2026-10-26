@@ -1925,13 +1925,12 @@ impl GroveDb {
     ) -> Result<RowFlow, Error> {
         let V1LayerCtx {
             lower_layers,
-            prove_options,
             query,
             internal_query,
             current_path,
             options,
-            current_depth,
             grove_version,
+            ..
         } = ctx;
         let mut path = current_path.to_vec();
         let key = &proved_key_value.key;
@@ -2063,192 +2062,19 @@ impl GroveDb {
                     Element::ProvableCountIndexedTree(..)
                     | Element::ProvableSumIndexedTree(..)
                     | Element::ProvableCountProvableSumIndexedTree(..) => {
-                        // An axis-read indexed tree was already
-                        // handled (and `continue`d) above, before
-                        // this lower-layer lookup, so here the
-                        // query descends the primary as usual.
-                        path.push(key);
-                        *last_parent_tree_type = element.tree_feature_type();
-                        if query.query_items_at_path(&path, grove_version)?.is_none() {
-                            // The indexed tree is itself a result and
-                            // nothing is queried below it. The element
-                            // bytes still have to be bound to the
-                            // parent-committed `value_hash`: a
-                            // `KVValueHash` node hashes only
-                            // (key, value_hash), so pushing the value
-                            // unchecked would let a prover swap in a
-                            // forged element (any count/sum it likes)
-                            // under a genuine root hash. Only the
-                            // terminal envelope can bind it here —
-                            // a descent envelope is unusable because
-                            // there is no query at the lower path to
-                            // verify it against.
-                            let ProofBytes::IndexedTreeTerminal(terminal_bytes) =
-                                &lower_layer.merk_proof
-                            else {
-                                return Err(invalid_proof(
-                                    query,
-                                    format!(
-                                        "V1 proof supplies a non-terminal lower layer for \
-                                         indexed tree at key {} with no query below it; \
-                                         the element bytes would be unbound",
-                                        hex::encode(key),
-                                    ),
-                                ));
-                            };
-                            if !lower_layer.lower_layers.is_empty() {
-                                return Err(invalid_proof(
-                                    query,
-                                    format!(
-                                        "V1 indexed terminal attestation at key {} must \
-                                         not carry further lower layers",
-                                        hex::encode(key),
-                                    ),
-                                ));
-                            }
-                            if terminal_bytes.len() != 64 {
-                                return Err(invalid_proof(
-                                    query,
-                                    format!(
-                                        "V1 indexed terminal attestation at key {} must \
-                                         be exactly 64 bytes (attestation || \
-                                         primary_root), got {}",
-                                        hex::encode(key),
-                                        terminal_bytes.len(),
-                                    ),
-                                ));
-                            }
-                            let mut attestation = [0u8; 32];
-                            attestation.copy_from_slice(&terminal_bytes[..32]);
-                            let mut primary_root = [0u8; 32];
-                            primary_root.copy_from_slice(&terminal_bytes[32..]);
-
-                            let combined_root_hash = combine_hash_three(
-                                value_hash(value_bytes).value(),
-                                &primary_root,
-                                &attestation,
-                            )
-                            .value()
-                            .to_owned();
-                            if hash != &combined_root_hash {
-                                return Err(invalid_proof(
-                                    query,
-                                    format!(
-                                        "V1 mismatch in indexed terminal attestation at \
-                                         key {}, expected {}, got {}",
-                                        hex::encode(key),
-                                        hex::encode(hash),
-                                        hex::encode(combined_root_hash)
-                                    ),
-                                ));
-                            }
-
-                            // Report under the PARENT path (path
-                            // without the trailing key we pushed for
-                            // descent), matching query_raw and the
-                            // regular-tree terminal arm. Including the
-                            // key made `(path, key)` lookups miss —
-                            // absence-proof verification would report
-                            // an EXISTING indexed tree as absent.
-                            let parent_path: Vec<Vec<u8>> =
-                                path_to_owned(&path[..path.len().saturating_sub(1)]);
-                            let path_key_optional_value =
-                                ProvedPathKeyOptionalValue::from_proved_key_value(
-                                    parent_path,
-                                    proved_key_value.clone(),
-                                );
-                            result.push_row(path_key_optional_value, grove_version)?;
-                            limit_state.charge_row_with_instance(frame_instance);
-                            if limit_state.is_exhausted(*frame_instance) {
-                                return Ok(RowFlow::Break);
-                            }
-                        } else {
-                            if query.should_add_parent_tree_at_path(current_path, grove_version)? {
-                                let path_key_optional_value =
-                                    ProvedPathKeyOptionalValue::from_proved_key_value(
-                                        path_to_owned(&path),
-                                        proved_key_value.clone(),
-                                    );
-                                result.push_row(path_key_optional_value, grove_version)?;
-                            }
-
-                            // Lower layer must carry cidx-shaped
-                            // proof bytes: secondary_root_hash (32)
-                            // followed by a standard Merk proof
-                            // against the primary.
-                            let cidx_bytes = match &lower_layer.merk_proof {
-                                ProofBytes::CountIndexedTree(b) => b,
-                                _ => {
-                                    return Err(invalid_proof(
-                                        query,
-                                        "V1 lower layer for CountIndexedTree element \
-                                         must use ProofBytes::CountIndexedTree"
-                                            .to_string(),
-                                    ));
-                                }
-                            };
-                            if cidx_bytes.len() < 32 {
-                                return Err(invalid_proof(
-                                    query,
-                                    "cidx proof bytes shorter than 32-byte secondary \
-                                     root attestation prefix"
-                                        .to_string(),
-                                ));
-                            }
-                            let mut secondary_root: [u8; 32] = [0u8; 32];
-                            secondary_root.copy_from_slice(&cidx_bytes[..32]);
-                            // Recurse straight into the primary proof
-                            // carved out of the indexed envelope,
-                            // borrowing this layer's descendants. This
-                            // used to synthesize a LayerProof, which
-                            // deep-copied `lower_layers` at every
-                            // nesting level — memory an untrusted peer
-                            // could multiply by nesting depth.
-                            let rows_before_descent = limit_state.consumed_rows;
-                            let primary_root_hash = Self::verify_layer_proof_v1(
-                                &cidx_bytes[32..],
-                                &lower_layer.lower_layers,
-                                prove_options,
-                                query,
-                                limit_state,
-                                *frame_instance,
-                                &path,
-                                result,
-                                axis_outcomes,
-                                last_parent_tree_type,
-                                options,
-                                current_depth + 1,
-                                grove_version,
-                            )?;
-                            super::V1LimitState::settle_instance_after_descent(
-                                frame_instance,
-                                rows_before_descent,
-                                limit_state.consumed_rows,
-                            );
-
-                            let combined_root_hash = combine_hash_three(
-                                value_hash(value_bytes).value(),
-                                &primary_root_hash,
-                                &secondary_root,
-                            )
-                            .value()
-                            .to_owned();
-
-                            if hash != &combined_root_hash {
-                                return Err(invalid_proof(
-                                    query,
-                                    format!(
-                                        "V1 mismatch in cidx lower-layer hash, \
-                                         expected {}, got {}",
-                                        hex::encode(hash),
-                                        hex::encode(combined_root_hash)
-                                    ),
-                                ));
-                            }
-                            if limit_state.is_exhausted(*frame_instance) {
-                                return Ok(RowFlow::Break);
-                            }
-                        }
+                        return Self::verify_indexed_lower_layer(
+                            ctx,
+                            proved_key_value,
+                            &element,
+                            value_bytes,
+                            lower_layer,
+                            path,
+                            limit_state,
+                            frame_instance,
+                            result,
+                            axis_outcomes,
+                            last_parent_tree_type,
+                        );
                     }
                     // The V1 prover rejects subqueries into a
                     // PrivateDocumentStore (range-read proofs are not
@@ -2275,314 +2101,19 @@ impl GroveDb {
                     | Element::MmrTree(..)
                     | Element::BulkAppendTree(..)
                     | Element::DenseAppendOnlyFixedSizeTree(..) => {
-                        path.push(key);
-                        *last_parent_tree_type = element.tree_feature_type();
-                        // Does the current query ask for anything BELOW
-                        // this tree, or only for the tree element
-                        // itself?
-                        //
-                        // "Only the element itself" while the proof
-                        // still carries a lower layer is the ordinary
-                        // shape of a SUBSET verification: the proof was
-                        // generated for a wider query that descended
-                        // here, and is now being re-verified against a
-                        // narrower one that stops at the tree. Dash
-                        // Platform does exactly this to read a
-                        // CommitmentTree's total note count out of the
-                        // note-fetch proof it already has.
-                        //
-                        // Either way the element bytes must stay bound
-                        // to the parent-committed `value_hash`: a
-                        // `KVValueHash`-family node hashes only
-                        // (key, value_hash), so reporting `value`
-                        // unchecked would let a prover attach a dummy
-                        // lower layer and substitute forged element
-                        // bytes under a genuine root hash. The
-                        // `combine_hash` chain check below is what binds
-                        // it, and it needs the lower layer's root — so
-                        // the lower layer is consumed for its root hash
-                        // in BOTH cases. Only the reporting differs:
-                        // with no query below, none of the lower layer's
-                        // rows belong in this query's result set, so the
-                        // tree element itself is reported instead.
-                        let has_query_below =
-                            query.query_items_at_path(&path, grove_version)?.is_some();
-
-                        if !has_query_below && options.verify_proof_succinctness {
-                            // Succinct mode demands the proof carry
-                            // nothing beyond what the query needs, and
-                            // an honest prover never emits this layer
-                            // for this query (every `lower_layers.insert`
-                            // site is gated on there being a subquery
-                            // for the key). Reject as extra data.
-                            return Err(invalid_proof(
-                                query,
-                                format!(
-                                    "V1 proof supplies a lower layer for tree at key {} \
-                                     with no query below it; the element bytes would be \
-                                     unbound",
-                                    hex::encode(key),
-                                ),
-                            ));
-                        }
-
-                        {
-                            // Known limitation: this parent tree result
-                            // is pushed without decrementing limit_left.
-                            // Will be addressed by per-level limits
-                            // redesign.
-                            if has_query_below
-                                && query
-                                    .should_add_parent_tree_at_path(current_path, grove_version)?
-                            {
-                                let path_key_optional_value =
-                                    ProvedPathKeyOptionalValue::from_proved_key_value(
-                                        path_to_owned(&path),
-                                        proved_key_value.clone(),
-                                    );
-                                result.push_row(path_key_optional_value, grove_version)?;
-                            }
-
-                            // Dispatch based on lower layer proof type.
-                            // `has_query_below == false` derives the
-                            // layer's root WITHOUT reporting any of its
-                            // contents — every lower-layer flavour
-                            // computes its root independently of the
-                            // query, which only ever selects rows.
-                            let rows_before_descent = limit_state.consumed_rows;
-                            let parent = ParentCommitment {
-                                value_bytes,
-                                value_hash: hash,
-                            };
-                            // Every arm binds the root it derives to
-                            // `parent`; the append-only ones do it
-                            // before reporting any row.
-                            match &lower_layer.merk_proof {
-                                ProofBytes::Merk(_) => {
-                                    // A sum-budget layer must carry
-                                    // the window envelope; a plain
-                                    // Merk descent here would let a
-                                    // prover serve a read-mode query
-                                    // as key selection.
-                                    if query.sum_budget_read_at_path(&path).is_some() {
-                                        return Err(invalid_proof(
-                                            query,
-                                            "the query node at this tree is a \
-                                             sum-budget read; its lower layer must \
-                                             carry ProofBytes::SumBudgetWindow"
-                                                .to_string(),
-                                        ));
-                                    }
-                                    // Standard Merk subtree - recurse
-                                    let merk_bytes = Self::merk_bytes_of_layer(lower_layer, query)?;
-                                    let lower_hash = if has_query_below {
-                                        Self::verify_layer_proof_v1(
-                                            merk_bytes,
-                                            &lower_layer.lower_layers,
-                                            prove_options,
-                                            query,
-                                            limit_state,
-                                            *frame_instance,
-                                            &path,
-                                            result,
-                                            axis_outcomes,
-                                            last_parent_tree_type,
-                                            options,
-                                            current_depth + 1,
-                                            grove_version,
-                                        )?
-                                    } else {
-                                        Self::merk_layer_root_hash(merk_bytes, query)?
-                                    };
-                                    parent.bind(query, &lower_hash)?;
-                                }
-                                ProofBytes::SumBudgetWindow(payload_bytes) => {
-                                    if !lower_layer.lower_layers.is_empty() {
-                                        return Err(invalid_proof(
-                                            query,
-                                            "a sum-budget window is terminal and must \
-                                             not carry further lower layers"
-                                                .to_string(),
-                                        ));
-                                    }
-                                    let lower_hash = Self::verify_sum_budget_window_layer(
-                                        payload_bytes,
-                                        &path,
-                                        axis_outcomes,
-                                        query,
-                                        grove_version,
-                                    )?;
-                                    parent.bind(query, &lower_hash)?;
-                                }
-                                ProofBytes::MMR(mmr_bytes) => {
-                                    // Mirror of the prover: min-compose
-                                    // the lower query's own per-instance
-                                    // cap — these adapters bypass the
-                                    // recursive frame creation.
-                                    let mut non_merk_effective = limit_state
-                                        .effective_lower_layer_limit(
-                                            *frame_instance,
-                                            query
-                                                .query_items_at_path(&path, grove_version)?
-                                                .and_then(|lower_query| lower_query.instance_limit),
-                                        );
-                                    let non_merk_before = non_merk_effective;
-                                    Self::verify_mmr_lower_layer(
-                                        mmr_bytes,
-                                        &element,
-                                        parent,
-                                        &path,
-                                        &mut non_merk_effective,
-                                        result,
-                                        query,
-                                        has_query_below,
-                                        grove_version,
-                                    )?;
-                                    limit_state.charge_rows(
-                                        non_merk_before
-                                            .unwrap_or(0)
-                                            .saturating_sub(non_merk_effective.unwrap_or(0)),
-                                    );
-                                }
-                                ProofBytes::BulkAppendTree(bulk_bytes) => {
-                                    // Mirror of the prover: min-compose
-                                    // the lower query's own per-instance
-                                    // cap — these adapters bypass the
-                                    // recursive frame creation.
-                                    let mut non_merk_effective = limit_state
-                                        .effective_lower_layer_limit(
-                                            *frame_instance,
-                                            query
-                                                .query_items_at_path(&path, grove_version)?
-                                                .and_then(|lower_query| lower_query.instance_limit),
-                                        );
-                                    let non_merk_before = non_merk_effective;
-                                    Self::verify_bulk_append_lower_layer(
-                                        bulk_bytes,
-                                        &element,
-                                        parent,
-                                        &path,
-                                        &mut non_merk_effective,
-                                        result,
-                                        query,
-                                        has_query_below,
-                                        grove_version,
-                                    )?;
-                                    limit_state.charge_rows(
-                                        non_merk_before
-                                            .unwrap_or(0)
-                                            .saturating_sub(non_merk_effective.unwrap_or(0)),
-                                    );
-                                }
-                                ProofBytes::DenseTree(dense_bytes) => {
-                                    // Mirror of the prover: min-compose
-                                    // the lower query's own per-instance
-                                    // cap — these adapters bypass the
-                                    // recursive frame creation.
-                                    let mut non_merk_effective = limit_state
-                                        .effective_lower_layer_limit(
-                                            *frame_instance,
-                                            query
-                                                .query_items_at_path(&path, grove_version)?
-                                                .and_then(|lower_query| lower_query.instance_limit),
-                                        );
-                                    let non_merk_before = non_merk_effective;
-                                    Self::verify_dense_tree_lower_layer(
-                                        dense_bytes,
-                                        &element,
-                                        parent,
-                                        &path,
-                                        &mut non_merk_effective,
-                                        result,
-                                        query,
-                                        has_query_below,
-                                        grove_version,
-                                    )?;
-                                    limit_state.charge_rows(
-                                        non_merk_before
-                                            .unwrap_or(0)
-                                            .saturating_sub(non_merk_effective.unwrap_or(0)),
-                                    );
-                                }
-                                ProofBytes::CommitmentTree(ct_bytes) => {
-                                    // Mirror of the prover: min-compose
-                                    // the lower query's own per-instance
-                                    // cap — these adapters bypass the
-                                    // recursive frame creation.
-                                    let mut non_merk_effective = limit_state
-                                        .effective_lower_layer_limit(
-                                            *frame_instance,
-                                            query
-                                                .query_items_at_path(&path, grove_version)?
-                                                .and_then(|lower_query| lower_query.instance_limit),
-                                        );
-                                    let non_merk_before = non_merk_effective;
-                                    Self::verify_commitment_tree_lower_layer(
-                                        ct_bytes,
-                                        &element,
-                                        parent,
-                                        &path,
-                                        &mut non_merk_effective,
-                                        result,
-                                        query,
-                                        has_query_below,
-                                        grove_version,
-                                    )?;
-                                    limit_state.charge_rows(
-                                        non_merk_before
-                                            .unwrap_or(0)
-                                            .saturating_sub(non_merk_effective.unwrap_or(0)),
-                                    );
-                                }
-                                ProofBytes::CountIndexedTree(_)
-                                | ProofBytes::IndexedTreeTerminal(_)
-                                | ProofBytes::IndexedTreeAxisDescent(_) => {
-                                    // Indexed-tree envelopes are
-                                    // dispatched in the dedicated
-                                    // arm above; reaching this point
-                                    // means the proof envelope put
-                                    // a cidx-shaped lower layer on
-                                    // a non-cidx parent element,
-                                    // which is malformed.
-                                    return Err(invalid_proof(
-                                        query,
-                                        "indexed-tree proof envelope under a non-indexed \
-                                         parent element"
-                                            .to_string(),
-                                    ));
-                                }
-                            };
-
-                            super::V1LimitState::settle_instance_after_descent(
-                                frame_instance,
-                                rows_before_descent,
-                                limit_state.consumed_rows,
-                            );
-
-                            if !has_query_below {
-                                // The tree element itself is the
-                                // result, now bound by the
-                                // `combine_hash` check above. Report it
-                                // under the PARENT path (not the path
-                                // we pushed the key onto for the root
-                                // derivation), matching query_raw and
-                                // the no-lower-layer terminal arm —
-                                // including the key would make
-                                // `(path, key)` lookups miss.
-                                let parent_path: Vec<Vec<u8>> = path_to_owned(current_path);
-                                let path_key_optional_value =
-                                    ProvedPathKeyOptionalValue::from_proved_key_value(
-                                        parent_path,
-                                        proved_key_value.clone(),
-                                    );
-                                result.push_row(path_key_optional_value, grove_version)?;
-                                limit_state.charge_row_with_instance(frame_instance);
-                            }
-
-                            if limit_state.is_exhausted(*frame_instance) {
-                                return Ok(RowFlow::Break);
-                            }
-                        }
+                        return Self::verify_tree_lower_layer(
+                            ctx,
+                            proved_key_value,
+                            &element,
+                            value_bytes,
+                            lower_layer,
+                            path,
+                            limit_state,
+                            frame_instance,
+                            result,
+                            axis_outcomes,
+                            last_parent_tree_type,
+                        );
                     }
                     // MmrTree/BulkAppendTree/CommitmentTree handled above
                     Element::Tree(None, _)
@@ -2621,112 +2152,31 @@ impl GroveDb {
                     && (options.include_empty_trees_in_result
                         || !matches!(element, Element::Tree(None, _)))
             {
-                // For empty trees in the result set (no lower layer
-                // proof), bind the element bytes to the proof's
-                // value_hash before trusting anything decoded from
-                // them (see `verify_empty_tree_binding`).
-                Self::verify_empty_tree_binding(query, key, &element, value_bytes, hash)?;
-
-                // For trees reported without a subquery (no lower layer
-                // proof), the prover must use
-                // KVValueHashFeatureTypeWithChildHash so the merk
-                // verifier can confirm combine_hash(H(value),
-                // child_hash) == value_hash. If child_hash_verified is
-                // false, an attacker may have downgraded the node type
-                // to hide child hash verification.
-                //
-                // Non-empty Merk trees (child_hash = child Merk root)
-                // have required this since V3 and are checked at every
-                // version.
-                //
-                // The four non-Merk trees — CommitmentTree, MmrTree,
-                // BulkAppendTree, DenseAppendOnlyFixedSizeTree
-                // (child_hash = the tree's own state root, which their
-                // parent commits through the same two-input
-                // combine_hash) — are checked only from V4, under
-                // `proof.terminal_non_merk_tree_child_hash`. V1..V3
-                // provers emit a bare KVValueHash here, so demanding
-                // the child hash from them would reject honest
-                // released proofs; the gate moves prover and verifier
-                // together at the protocol boundary. Until it
-                // activates, the element bytes of a terminally-reported
-                // non-Merk tree stay unbound and a prover can forge the
-                // entry count callers read from them.
-                //
-                // `is_non_empty_tree` is true unconditionally for those
-                // four, so an empty one is bound too — its committed
-                // child hash is NULL_HASH, or
-                // EMPTY_COMMITMENT_TREE_STATE_ROOT for a
-                // CommitmentTree.
-                let requires_child_hash = element.is_non_empty_merk_tree()
-                    || (grove_version
-                        .grovedb_versions
-                        .operations
-                        .proof
-                        .terminal_non_merk_tree_child_hash
-                        >= 1
-                        && element.is_non_empty_tree());
-                if requires_child_hash && !proved_key_value.child_hash_verified {
-                    return Err(invalid_proof(
-                        query,
-                        format!(
-                            "V1 non-empty tree at key {} without subquery must use \
-                             KVValueHashFeatureTypeWithChildHash proof node",
-                            hex::encode(key),
-                        ),
-                    ));
-                }
-
-                let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
-                    path_to_owned(&path),
-                    proved_key_value.clone(),
+                return Self::verify_terminal_row(
+                    ctx,
+                    proved_key_value,
+                    &element,
+                    value_bytes,
+                    path,
+                    limit_state,
+                    frame_instance,
+                    result,
                 );
-                result.push_row(path_key_optional_value, grove_version)?;
-                limit_state.charge_row_with_instance(frame_instance);
-                if limit_state.is_exhausted(*frame_instance) {
-                    return Ok(RowFlow::Break);
-                }
             } else if element.is_any_tree()
                 && !element.is_non_empty_tree()
                 && internal_query.has_subquery_or_matching_in_path_on_key(key)
             {
-                // An EMPTY tree a subquery matches: an empty
-                // child, not a result row. "Empty" is so far
-                // only what the element bytes CLAIM, and a
-                // `KVValueHash*` node does not hash those bytes
-                // — a prover can rewrite a populated tree into
-                // its empty form, omit the lower layer, and the
-                // root still verifies. Bind the claim to the
-                // proof's value_hash before acting on it; the
-                // real tree's child hash is NULL_HASH only if it
-                // really is empty (issue #869).
-                Self::verify_empty_tree_binding(query, key, &element, value_bytes, hash)?;
-                // There is no lower layer to descend into, but this
-                // verified empty tree still supplies the parent-info
-                // result. Do not leave a populated ancestor's metadata
-                // behind (or None when the target is a root child).
-                *last_parent_tree_type = element.tree_feature_type();
-                // When the governing query asks for parent-tree
-                // inclusion, the matched parent is still
-                // reported — empty and non-empty parents must
-                // behave alike — and, like every parent-tree
-                // row, it does not consume a budget slot (the
-                // documented known limitation on the flag).
-                if query.should_add_parent_tree_at_path(current_path, grove_version)? {
-                    let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
-                        path_to_owned(&path),
-                        proved_key_value.clone(),
-                    );
-                    result.push_row(path_key_optional_value, grove_version)?;
-                }
-                // Mirror the prover's charge exactly — global
-                // budget only (it bounds walks across many
-                // empty children), per-instance budgets count
-                // result rows.
-                limit_state.charge_empty_layer();
-                if limit_state.is_exhausted(*frame_instance) {
-                    return Ok(RowFlow::Break);
-                }
+                return Self::verify_empty_subquery_tree(
+                    ctx,
+                    proved_key_value,
+                    &element,
+                    value_bytes,
+                    path,
+                    limit_state,
+                    frame_instance,
+                    result,
+                    last_parent_tree_type,
+                );
             } else if element.is_non_empty_tree()
                 && internal_query.has_subquery_or_matching_in_path_on_key(key)
             {
@@ -2764,6 +2214,694 @@ impl GroveDb {
                     ),
                 ));
             }
+        }
+        Ok(RowFlow::Continue)
+    }
+
+    /// A V1 row whose element is an indexed tree (PCIT / PSIT / PCPSIT)
+    /// with a lower layer: the indexed-tree arm of `verify_v1_row`.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_indexed_lower_layer<'a, S: RowSink>(
+        ctx: V1LayerCtx<'a>,
+        proved_key_value: &'a ProvedKeyOptionalValue,
+        element: &Element,
+        value_bytes: &'a [u8],
+        lower_layer: &'a LayerProof,
+        mut path: Vec<&'a [u8]>,
+        limit_state: &mut super::V1LimitState,
+        frame_instance: &mut Option<u16>,
+        result: &mut S,
+        axis_outcomes: &mut Vec<AxisWalkOutcome>,
+        last_parent_tree_type: &mut Option<TreeFeatureType>,
+    ) -> Result<RowFlow, Error> {
+        let V1LayerCtx {
+            prove_options,
+            query,
+            current_path,
+            options,
+            current_depth,
+            grove_version,
+            ..
+        } = ctx;
+        let key = &proved_key_value.key;
+        let hash = &proved_key_value.proof;
+        // An axis-read indexed tree was already
+        // handled (and `continue`d) above, before
+        // this lower-layer lookup, so here the
+        // query descends the primary as usual.
+        path.push(key);
+        *last_parent_tree_type = element.tree_feature_type();
+        if query.query_items_at_path(&path, grove_version)?.is_none() {
+            // The indexed tree is itself a result and
+            // nothing is queried below it. The element
+            // bytes still have to be bound to the
+            // parent-committed `value_hash`: a
+            // `KVValueHash` node hashes only
+            // (key, value_hash), so pushing the value
+            // unchecked would let a prover swap in a
+            // forged element (any count/sum it likes)
+            // under a genuine root hash. Only the
+            // terminal envelope can bind it here —
+            // a descent envelope is unusable because
+            // there is no query at the lower path to
+            // verify it against.
+            let ProofBytes::IndexedTreeTerminal(terminal_bytes) = &lower_layer.merk_proof else {
+                return Err(invalid_proof(
+                    query,
+                    format!(
+                        "V1 proof supplies a non-terminal lower layer for \
+                         indexed tree at key {} with no query below it; \
+                         the element bytes would be unbound",
+                        hex::encode(key),
+                    ),
+                ));
+            };
+            if !lower_layer.lower_layers.is_empty() {
+                return Err(invalid_proof(
+                    query,
+                    format!(
+                        "V1 indexed terminal attestation at key {} must \
+                         not carry further lower layers",
+                        hex::encode(key),
+                    ),
+                ));
+            }
+            if terminal_bytes.len() != 64 {
+                return Err(invalid_proof(
+                    query,
+                    format!(
+                        "V1 indexed terminal attestation at key {} must \
+                         be exactly 64 bytes (attestation || \
+                         primary_root), got {}",
+                        hex::encode(key),
+                        terminal_bytes.len(),
+                    ),
+                ));
+            }
+            let mut attestation = [0u8; 32];
+            attestation.copy_from_slice(&terminal_bytes[..32]);
+            let mut primary_root = [0u8; 32];
+            primary_root.copy_from_slice(&terminal_bytes[32..]);
+
+            let combined_root_hash =
+                combine_hash_three(value_hash(value_bytes).value(), &primary_root, &attestation)
+                    .value()
+                    .to_owned();
+            if hash != &combined_root_hash {
+                return Err(invalid_proof(
+                    query,
+                    format!(
+                        "V1 mismatch in indexed terminal attestation at \
+                         key {}, expected {}, got {}",
+                        hex::encode(key),
+                        hex::encode(hash),
+                        hex::encode(combined_root_hash)
+                    ),
+                ));
+            }
+
+            // Report under the PARENT path (path
+            // without the trailing key we pushed for
+            // descent), matching query_raw and the
+            // regular-tree terminal arm. Including the
+            // key made `(path, key)` lookups miss —
+            // absence-proof verification would report
+            // an EXISTING indexed tree as absent.
+            let parent_path: Vec<Vec<u8>> = path_to_owned(&path[..path.len().saturating_sub(1)]);
+            let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
+                parent_path,
+                proved_key_value.clone(),
+            );
+            result.push_row(path_key_optional_value, grove_version)?;
+            limit_state.charge_row_with_instance(frame_instance);
+            if limit_state.is_exhausted(*frame_instance) {
+                return Ok(RowFlow::Break);
+            }
+        } else {
+            if query.should_add_parent_tree_at_path(current_path, grove_version)? {
+                let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
+                    path_to_owned(&path),
+                    proved_key_value.clone(),
+                );
+                result.push_row(path_key_optional_value, grove_version)?;
+            }
+
+            // Lower layer must carry cidx-shaped
+            // proof bytes: secondary_root_hash (32)
+            // followed by a standard Merk proof
+            // against the primary.
+            let cidx_bytes = match &lower_layer.merk_proof {
+                ProofBytes::CountIndexedTree(b) => b,
+                _ => {
+                    return Err(invalid_proof(
+                        query,
+                        "V1 lower layer for CountIndexedTree element \
+                         must use ProofBytes::CountIndexedTree"
+                            .to_string(),
+                    ));
+                }
+            };
+            if cidx_bytes.len() < 32 {
+                return Err(invalid_proof(
+                    query,
+                    "cidx proof bytes shorter than 32-byte secondary \
+                     root attestation prefix"
+                        .to_string(),
+                ));
+            }
+            let mut secondary_root: [u8; 32] = [0u8; 32];
+            secondary_root.copy_from_slice(&cidx_bytes[..32]);
+            // Recurse straight into the primary proof
+            // carved out of the indexed envelope,
+            // borrowing this layer's descendants. This
+            // used to synthesize a LayerProof, which
+            // deep-copied `lower_layers` at every
+            // nesting level — memory an untrusted peer
+            // could multiply by nesting depth.
+            let rows_before_descent = limit_state.consumed_rows;
+            let primary_root_hash = Self::verify_layer_proof_v1(
+                &cidx_bytes[32..],
+                &lower_layer.lower_layers,
+                prove_options,
+                query,
+                limit_state,
+                *frame_instance,
+                &path,
+                result,
+                axis_outcomes,
+                last_parent_tree_type,
+                options,
+                current_depth + 1,
+                grove_version,
+            )?;
+            super::V1LimitState::settle_instance_after_descent(
+                frame_instance,
+                rows_before_descent,
+                limit_state.consumed_rows,
+            );
+
+            let combined_root_hash = combine_hash_three(
+                value_hash(value_bytes).value(),
+                &primary_root_hash,
+                &secondary_root,
+            )
+            .value()
+            .to_owned();
+
+            if hash != &combined_root_hash {
+                return Err(invalid_proof(
+                    query,
+                    format!(
+                        "V1 mismatch in cidx lower-layer hash, \
+                         expected {}, got {}",
+                        hex::encode(hash),
+                        hex::encode(combined_root_hash)
+                    ),
+                ));
+            }
+            if limit_state.is_exhausted(*frame_instance) {
+                return Ok(RowFlow::Break);
+            }
+        }
+        Ok(RowFlow::Continue)
+    }
+
+    /// A V1 row whose element is a non-empty Merk tree or a non-Merk tree
+    /// with a lower layer: the tree arm of `verify_v1_row`.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_tree_lower_layer<'a, S: RowSink>(
+        ctx: V1LayerCtx<'a>,
+        proved_key_value: &'a ProvedKeyOptionalValue,
+        element: &Element,
+        value_bytes: &'a [u8],
+        lower_layer: &'a LayerProof,
+        mut path: Vec<&'a [u8]>,
+        limit_state: &mut super::V1LimitState,
+        frame_instance: &mut Option<u16>,
+        result: &mut S,
+        axis_outcomes: &mut Vec<AxisWalkOutcome>,
+        last_parent_tree_type: &mut Option<TreeFeatureType>,
+    ) -> Result<RowFlow, Error> {
+        let V1LayerCtx {
+            prove_options,
+            query,
+            current_path,
+            options,
+            current_depth,
+            grove_version,
+            ..
+        } = ctx;
+        let key = &proved_key_value.key;
+        let hash = &proved_key_value.proof;
+        path.push(key);
+        *last_parent_tree_type = element.tree_feature_type();
+        // Does the current query ask for anything BELOW
+        // this tree, or only for the tree element
+        // itself?
+        //
+        // "Only the element itself" while the proof
+        // still carries a lower layer is the ordinary
+        // shape of a SUBSET verification: the proof was
+        // generated for a wider query that descended
+        // here, and is now being re-verified against a
+        // narrower one that stops at the tree. Dash
+        // Platform does exactly this to read a
+        // CommitmentTree's total note count out of the
+        // note-fetch proof it already has.
+        //
+        // Either way the element bytes must stay bound
+        // to the parent-committed `value_hash`: a
+        // `KVValueHash`-family node hashes only
+        // (key, value_hash), so reporting `value`
+        // unchecked would let a prover attach a dummy
+        // lower layer and substitute forged element
+        // bytes under a genuine root hash. The
+        // `combine_hash` chain check below is what binds
+        // it, and it needs the lower layer's root — so
+        // the lower layer is consumed for its root hash
+        // in BOTH cases. Only the reporting differs:
+        // with no query below, none of the lower layer's
+        // rows belong in this query's result set, so the
+        // tree element itself is reported instead.
+        let has_query_below = query.query_items_at_path(&path, grove_version)?.is_some();
+
+        if !has_query_below && options.verify_proof_succinctness {
+            // Succinct mode demands the proof carry
+            // nothing beyond what the query needs, and
+            // an honest prover never emits this layer
+            // for this query (every `lower_layers.insert`
+            // site is gated on there being a subquery
+            // for the key). Reject as extra data.
+            return Err(invalid_proof(
+                query,
+                format!(
+                    "V1 proof supplies a lower layer for tree at key {} \
+                     with no query below it; the element bytes would be \
+                     unbound",
+                    hex::encode(key),
+                ),
+            ));
+        }
+
+        {
+            // Known limitation: this parent tree result
+            // is pushed without decrementing limit_left.
+            // Will be addressed by per-level limits
+            // redesign.
+            if has_query_below
+                && query.should_add_parent_tree_at_path(current_path, grove_version)?
+            {
+                let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
+                    path_to_owned(&path),
+                    proved_key_value.clone(),
+                );
+                result.push_row(path_key_optional_value, grove_version)?;
+            }
+
+            // Dispatch based on lower layer proof type.
+            // `has_query_below == false` derives the
+            // layer's root WITHOUT reporting any of its
+            // contents — every lower-layer flavour
+            // computes its root independently of the
+            // query, which only ever selects rows.
+            let rows_before_descent = limit_state.consumed_rows;
+            let parent = ParentCommitment {
+                value_bytes,
+                value_hash: hash,
+            };
+            // Every arm binds the root it derives to
+            // `parent`; the append-only ones do it
+            // before reporting any row.
+            match &lower_layer.merk_proof {
+                ProofBytes::Merk(_) => {
+                    // A sum-budget layer must carry
+                    // the window envelope; a plain
+                    // Merk descent here would let a
+                    // prover serve a read-mode query
+                    // as key selection.
+                    if query.sum_budget_read_at_path(&path).is_some() {
+                        return Err(invalid_proof(
+                            query,
+                            "the query node at this tree is a \
+                             sum-budget read; its lower layer must \
+                             carry ProofBytes::SumBudgetWindow"
+                                .to_string(),
+                        ));
+                    }
+                    // Standard Merk subtree - recurse
+                    let merk_bytes = Self::merk_bytes_of_layer(lower_layer, query)?;
+                    let lower_hash = if has_query_below {
+                        Self::verify_layer_proof_v1(
+                            merk_bytes,
+                            &lower_layer.lower_layers,
+                            prove_options,
+                            query,
+                            limit_state,
+                            *frame_instance,
+                            &path,
+                            result,
+                            axis_outcomes,
+                            last_parent_tree_type,
+                            options,
+                            current_depth + 1,
+                            grove_version,
+                        )?
+                    } else {
+                        Self::merk_layer_root_hash(merk_bytes, query)?
+                    };
+                    parent.bind(query, &lower_hash)?;
+                }
+                ProofBytes::SumBudgetWindow(payload_bytes) => {
+                    if !lower_layer.lower_layers.is_empty() {
+                        return Err(invalid_proof(
+                            query,
+                            "a sum-budget window is terminal and must \
+                             not carry further lower layers"
+                                .to_string(),
+                        ));
+                    }
+                    let lower_hash = Self::verify_sum_budget_window_layer(
+                        payload_bytes,
+                        &path,
+                        axis_outcomes,
+                        query,
+                        grove_version,
+                    )?;
+                    parent.bind(query, &lower_hash)?;
+                }
+                ProofBytes::MMR(mmr_bytes) => {
+                    // Mirror of the prover: min-compose
+                    // the lower query's own per-instance
+                    // cap — these adapters bypass the
+                    // recursive frame creation.
+                    let mut non_merk_effective = limit_state.effective_lower_layer_limit(
+                        *frame_instance,
+                        query
+                            .query_items_at_path(&path, grove_version)?
+                            .and_then(|lower_query| lower_query.instance_limit),
+                    );
+                    let non_merk_before = non_merk_effective;
+                    Self::verify_mmr_lower_layer(
+                        mmr_bytes,
+                        element,
+                        parent,
+                        &path,
+                        &mut non_merk_effective,
+                        result,
+                        query,
+                        has_query_below,
+                        grove_version,
+                    )?;
+                    limit_state.charge_rows(
+                        non_merk_before
+                            .unwrap_or(0)
+                            .saturating_sub(non_merk_effective.unwrap_or(0)),
+                    );
+                }
+                ProofBytes::BulkAppendTree(bulk_bytes) => {
+                    // Mirror of the prover: min-compose
+                    // the lower query's own per-instance
+                    // cap — these adapters bypass the
+                    // recursive frame creation.
+                    let mut non_merk_effective = limit_state.effective_lower_layer_limit(
+                        *frame_instance,
+                        query
+                            .query_items_at_path(&path, grove_version)?
+                            .and_then(|lower_query| lower_query.instance_limit),
+                    );
+                    let non_merk_before = non_merk_effective;
+                    Self::verify_bulk_append_lower_layer(
+                        bulk_bytes,
+                        element,
+                        parent,
+                        &path,
+                        &mut non_merk_effective,
+                        result,
+                        query,
+                        has_query_below,
+                        grove_version,
+                    )?;
+                    limit_state.charge_rows(
+                        non_merk_before
+                            .unwrap_or(0)
+                            .saturating_sub(non_merk_effective.unwrap_or(0)),
+                    );
+                }
+                ProofBytes::DenseTree(dense_bytes) => {
+                    // Mirror of the prover: min-compose
+                    // the lower query's own per-instance
+                    // cap — these adapters bypass the
+                    // recursive frame creation.
+                    let mut non_merk_effective = limit_state.effective_lower_layer_limit(
+                        *frame_instance,
+                        query
+                            .query_items_at_path(&path, grove_version)?
+                            .and_then(|lower_query| lower_query.instance_limit),
+                    );
+                    let non_merk_before = non_merk_effective;
+                    Self::verify_dense_tree_lower_layer(
+                        dense_bytes,
+                        element,
+                        parent,
+                        &path,
+                        &mut non_merk_effective,
+                        result,
+                        query,
+                        has_query_below,
+                        grove_version,
+                    )?;
+                    limit_state.charge_rows(
+                        non_merk_before
+                            .unwrap_or(0)
+                            .saturating_sub(non_merk_effective.unwrap_or(0)),
+                    );
+                }
+                ProofBytes::CommitmentTree(ct_bytes) => {
+                    // Mirror of the prover: min-compose
+                    // the lower query's own per-instance
+                    // cap — these adapters bypass the
+                    // recursive frame creation.
+                    let mut non_merk_effective = limit_state.effective_lower_layer_limit(
+                        *frame_instance,
+                        query
+                            .query_items_at_path(&path, grove_version)?
+                            .and_then(|lower_query| lower_query.instance_limit),
+                    );
+                    let non_merk_before = non_merk_effective;
+                    Self::verify_commitment_tree_lower_layer(
+                        ct_bytes,
+                        element,
+                        parent,
+                        &path,
+                        &mut non_merk_effective,
+                        result,
+                        query,
+                        has_query_below,
+                        grove_version,
+                    )?;
+                    limit_state.charge_rows(
+                        non_merk_before
+                            .unwrap_or(0)
+                            .saturating_sub(non_merk_effective.unwrap_or(0)),
+                    );
+                }
+                ProofBytes::CountIndexedTree(_)
+                | ProofBytes::IndexedTreeTerminal(_)
+                | ProofBytes::IndexedTreeAxisDescent(_) => {
+                    // Indexed-tree envelopes are
+                    // dispatched in the dedicated
+                    // arm above; reaching this point
+                    // means the proof envelope put
+                    // a cidx-shaped lower layer on
+                    // a non-cidx parent element,
+                    // which is malformed.
+                    return Err(invalid_proof(
+                        query,
+                        "indexed-tree proof envelope under a non-indexed \
+                         parent element"
+                            .to_string(),
+                    ));
+                }
+            };
+
+            super::V1LimitState::settle_instance_after_descent(
+                frame_instance,
+                rows_before_descent,
+                limit_state.consumed_rows,
+            );
+
+            if !has_query_below {
+                // The tree element itself is the
+                // result, now bound by the
+                // `combine_hash` check above. Report it
+                // under the PARENT path (not the path
+                // we pushed the key onto for the root
+                // derivation), matching query_raw and
+                // the no-lower-layer terminal arm —
+                // including the key would make
+                // `(path, key)` lookups miss.
+                let parent_path: Vec<Vec<u8>> = path_to_owned(current_path);
+                let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
+                    parent_path,
+                    proved_key_value.clone(),
+                );
+                result.push_row(path_key_optional_value, grove_version)?;
+                limit_state.charge_row_with_instance(frame_instance);
+            }
+
+            if limit_state.is_exhausted(*frame_instance) {
+                return Ok(RowFlow::Break);
+            }
+        }
+        Ok(RowFlow::Continue)
+    }
+
+    /// A V1 row without a lower layer that is reported as a result: an
+    /// item, or a tree the query does not descend into.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_terminal_row<'a, S: RowSink>(
+        ctx: V1LayerCtx<'a>,
+        proved_key_value: &'a ProvedKeyOptionalValue,
+        element: &Element,
+        value_bytes: &'a [u8],
+        path: Vec<&'a [u8]>,
+        limit_state: &mut super::V1LimitState,
+        frame_instance: &mut Option<u16>,
+        result: &mut S,
+    ) -> Result<RowFlow, Error> {
+        let V1LayerCtx {
+            query,
+            grove_version,
+            ..
+        } = ctx;
+        let key = &proved_key_value.key;
+        let hash = &proved_key_value.proof;
+        // For empty trees in the result set (no lower layer
+        // proof), bind the element bytes to the proof's
+        // value_hash before trusting anything decoded from
+        // them (see `verify_empty_tree_binding`).
+        Self::verify_empty_tree_binding(query, key, element, value_bytes, hash)?;
+
+        // For trees reported without a subquery (no lower layer
+        // proof), the prover must use
+        // KVValueHashFeatureTypeWithChildHash so the merk
+        // verifier can confirm combine_hash(H(value),
+        // child_hash) == value_hash. If child_hash_verified is
+        // false, an attacker may have downgraded the node type
+        // to hide child hash verification.
+        //
+        // Non-empty Merk trees (child_hash = child Merk root)
+        // have required this since V3 and are checked at every
+        // version.
+        //
+        // The four non-Merk trees — CommitmentTree, MmrTree,
+        // BulkAppendTree, DenseAppendOnlyFixedSizeTree
+        // (child_hash = the tree's own state root, which their
+        // parent commits through the same two-input
+        // combine_hash) — are checked only from V4, under
+        // `proof.terminal_non_merk_tree_child_hash`. V1..V3
+        // provers emit a bare KVValueHash here, so demanding
+        // the child hash from them would reject honest
+        // released proofs; the gate moves prover and verifier
+        // together at the protocol boundary. Until it
+        // activates, the element bytes of a terminally-reported
+        // non-Merk tree stay unbound and a prover can forge the
+        // entry count callers read from them.
+        //
+        // `is_non_empty_tree` is true unconditionally for those
+        // four, so an empty one is bound too — its committed
+        // child hash is NULL_HASH, or
+        // EMPTY_COMMITMENT_TREE_STATE_ROOT for a
+        // CommitmentTree.
+        let requires_child_hash = element.is_non_empty_merk_tree()
+            || (grove_version
+                .grovedb_versions
+                .operations
+                .proof
+                .terminal_non_merk_tree_child_hash
+                >= 1
+                && element.is_non_empty_tree());
+        if requires_child_hash && !proved_key_value.child_hash_verified {
+            return Err(invalid_proof(
+                query,
+                format!(
+                    "V1 non-empty tree at key {} without subquery must use \
+                     KVValueHashFeatureTypeWithChildHash proof node",
+                    hex::encode(key),
+                ),
+            ));
+        }
+
+        let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
+            path_to_owned(&path),
+            proved_key_value.clone(),
+        );
+        result.push_row(path_key_optional_value, grove_version)?;
+        limit_state.charge_row_with_instance(frame_instance);
+        if limit_state.is_exhausted(*frame_instance) {
+            return Ok(RowFlow::Break);
+        }
+        Ok(RowFlow::Continue)
+    }
+
+    /// A V1 row whose element is an empty tree a subquery matches, so
+    /// there is no lower layer to descend into.
+    #[allow(clippy::too_many_arguments)]
+    fn verify_empty_subquery_tree<'a, S: RowSink>(
+        ctx: V1LayerCtx<'a>,
+        proved_key_value: &'a ProvedKeyOptionalValue,
+        element: &Element,
+        value_bytes: &'a [u8],
+        path: Vec<&'a [u8]>,
+        limit_state: &mut super::V1LimitState,
+        frame_instance: &mut Option<u16>,
+        result: &mut S,
+        last_parent_tree_type: &mut Option<TreeFeatureType>,
+    ) -> Result<RowFlow, Error> {
+        let V1LayerCtx {
+            query,
+            current_path,
+            grove_version,
+            ..
+        } = ctx;
+        let key = &proved_key_value.key;
+        let hash = &proved_key_value.proof;
+        // An EMPTY tree a subquery matches: an empty
+        // child, not a result row. "Empty" is so far
+        // only what the element bytes CLAIM, and a
+        // `KVValueHash*` node does not hash those bytes
+        // — a prover can rewrite a populated tree into
+        // its empty form, omit the lower layer, and the
+        // root still verifies. Bind the claim to the
+        // proof's value_hash before acting on it; the
+        // real tree's child hash is NULL_HASH only if it
+        // really is empty (issue #869).
+        Self::verify_empty_tree_binding(query, key, element, value_bytes, hash)?;
+        // There is no lower layer to descend into, but this
+        // verified empty tree still supplies the parent-info
+        // result. Do not leave a populated ancestor's metadata
+        // behind (or None when the target is a root child).
+        *last_parent_tree_type = element.tree_feature_type();
+        // When the governing query asks for parent-tree
+        // inclusion, the matched parent is still
+        // reported — empty and non-empty parents must
+        // behave alike — and, like every parent-tree
+        // row, it does not consume a budget slot (the
+        // documented known limitation on the flag).
+        if query.should_add_parent_tree_at_path(current_path, grove_version)? {
+            let path_key_optional_value = ProvedPathKeyOptionalValue::from_proved_key_value(
+                path_to_owned(&path),
+                proved_key_value.clone(),
+            );
+            result.push_row(path_key_optional_value, grove_version)?;
+        }
+        // Mirror the prover's charge exactly — global
+        // budget only (it bounds walks across many
+        // empty children), per-instance budgets count
+        // result rows.
+        limit_state.charge_empty_layer();
+        if limit_state.is_exhausted(*frame_instance) {
+            return Ok(RowFlow::Break);
         }
         Ok(RowFlow::Continue)
     }
