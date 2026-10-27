@@ -161,16 +161,10 @@ impl Query {
         };
         match inner {
             QueryItem::Key(_) => {
-                return Err(Error::InvalidOperation(
-                    "AggregateCountOnRange may not wrap Key — use has_raw / get_raw for \
-                     existence tests",
-                ));
+                return Err(non_ascii_messages::leaf_wraps_key());
             }
             QueryItem::RangeFull(_) => {
-                return Err(Error::InvalidOperation(
-                    "AggregateCountOnRange may not wrap RangeFull — read the parent \
-                     ProvableCountTree element for the unconditional total",
-                ));
+                return Err(non_ascii_messages::leaf_wraps_range_full());
             }
             QueryItem::AggregateCountOnRange(_) => {
                 return Err(Error::InvalidOperation(
@@ -178,16 +172,10 @@ impl Query {
                 ));
             }
             QueryItem::AggregateSumOnRange(_) => {
-                return Err(Error::InvalidOperation(
-                    "AggregateCountOnRange may not wrap AggregateSumOnRange — the \
-                     aggregate variants are orthogonal",
-                ));
+                return Err(non_ascii_messages::leaf_wraps_aggregate_sum());
             }
             QueryItem::AggregateCountAndSumOnRange(_) => {
-                return Err(Error::InvalidOperation(
-                    "AggregateCountOnRange may not wrap AggregateCountAndSumOnRange — the \
-                     aggregate variants are orthogonal",
-                ));
+                return Err(non_ascii_messages::leaf_wraps_aggregate_count_and_sum());
             }
             _ => {}
         }
@@ -313,19 +301,13 @@ fn carrier_count_outer_item_error(item: &QueryItem) -> Option<Error> {
         QueryItem::RangeFull(_) => Some(Error::InvalidOperation(
             "carrier AggregateCountOnRange query may not have a RangeFull outer item",
         )),
-        QueryItem::AggregateCountOnRange(_) => Some(Error::InvalidOperation(
-            "carrier AggregateCountOnRange query may not own an \
-                 AggregateCountOnRange item — use the leaf shape instead",
-        )),
-        QueryItem::AggregateSumOnRange(_) => Some(Error::InvalidOperation(
-            "carrier AggregateCountOnRange query may not own an \
-                 AggregateSumOnRange item — the two aggregate variants are orthogonal",
-        )),
-        QueryItem::AggregateCountAndSumOnRange(_) => Some(Error::InvalidOperation(
-            "carrier AggregateCountOnRange query may not own an \
-                 AggregateCountAndSumOnRange item — the aggregate variants are \
-                 orthogonal",
-        )),
+        QueryItem::AggregateCountOnRange(_) => {
+            Some(non_ascii_messages::carrier_owns_aggregate_count())
+        }
+        QueryItem::AggregateSumOnRange(_) => Some(non_ascii_messages::carrier_owns_aggregate_sum()),
+        QueryItem::AggregateCountAndSumOnRange(_) => {
+            Some(non_ascii_messages::carrier_owns_aggregate_count_and_sum())
+        }
     }
 }
 
@@ -358,6 +340,78 @@ fn first_aggregate_count_on_range(items: &[QueryItem]) -> Option<&QueryItem> {
         Some(&items[i])
     } else {
         None
+    }
+}
+
+/// Error values whose messages contain non-ASCII text (an em dash), built
+/// out of line: the extracted Lean model cannot carry such string literals,
+/// so the closure configuration marks this module opaque. The messages are
+/// verbatim; callers return these exactly where they built them before.
+mod non_ascii_messages {
+    use crate::error::Error;
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn leaf_wraps_key() -> Error {
+        Error::InvalidOperation(
+            "AggregateCountOnRange may not wrap Key — use has_raw / get_raw for \
+             existence tests",
+        )
+    }
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn leaf_wraps_range_full() -> Error {
+        Error::InvalidOperation(
+            "AggregateCountOnRange may not wrap RangeFull — read the parent \
+             ProvableCountTree element for the unconditional total",
+        )
+    }
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn leaf_wraps_aggregate_sum() -> Error {
+        Error::InvalidOperation(
+            "AggregateCountOnRange may not wrap AggregateSumOnRange — the \
+             aggregate variants are orthogonal",
+        )
+    }
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn leaf_wraps_aggregate_count_and_sum() -> Error {
+        Error::InvalidOperation(
+            "AggregateCountOnRange may not wrap AggregateCountAndSumOnRange — the \
+             aggregate variants are orthogonal",
+        )
+    }
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn carrier_owns_aggregate_count() -> Error {
+        Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not own an \
+             AggregateCountOnRange item — use the leaf shape instead",
+        )
+    }
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn carrier_owns_aggregate_sum() -> Error {
+        Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not own an \
+             AggregateSumOnRange item — the two aggregate variants are orthogonal",
+        )
+    }
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn carrier_owns_aggregate_count_and_sum() -> Error {
+        Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not own an \
+             AggregateCountAndSumOnRange item — the aggregate variants are \
+             orthogonal",
+        )
     }
 }
 

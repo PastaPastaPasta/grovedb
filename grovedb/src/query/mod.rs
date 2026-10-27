@@ -183,16 +183,10 @@ impl SizedQuery {
     /// `offset` would silently change the answer, so both are rejected.
     fn check_leaf_aggregate_count_size_constraints(&self) -> Result<(), Error> {
         if self.limit.is_some() {
-            return Err(Error::InvalidQuery(
-                "leaf AggregateCountOnRange queries may not set SizedQuery::limit — a leaf \
-                 returns a single u64 and pagination would silently change the answer",
-            ));
+            return Err(non_ascii_messages::count_leaf_limit());
         }
         if self.offset.is_some() {
-            return Err(Error::InvalidQuery(
-                "leaf AggregateCountOnRange queries may not set SizedQuery::offset — same \
-                 reason as limit",
-            ));
+            return Err(non_ascii_messages::count_leaf_offset());
         }
         Ok(())
     }
@@ -206,11 +200,7 @@ impl SizedQuery {
     /// in the proof, and the use case for that hasn't been designed yet.
     fn check_carrier_aggregate_count_size_constraints(&self) -> Result<(), Error> {
         if self.offset.is_some() {
-            return Err(Error::InvalidQuery(
-                "carrier AggregateCountOnRange queries may not set SizedQuery::offset — \
-                 skipping outer matches changes which (outer_key, u64) pairs end up in the \
-                 proof; the use case for this isn't designed yet",
-            ));
+            return Err(non_ascii_messages::count_carrier_offset());
         }
         Ok(())
     }
@@ -392,16 +382,10 @@ impl SizedQuery {
     /// `offset` would silently change the answer, so both are rejected.
     fn check_leaf_aggregate_sum_size_constraints(&self) -> Result<(), Error> {
         if self.limit.is_some() {
-            return Err(Error::InvalidQuery(
-                "leaf AggregateSumOnRange queries may not set SizedQuery::limit — a leaf \
-                 returns a single i64 and pagination would silently change the answer",
-            ));
+            return Err(non_ascii_messages::sum_leaf_limit());
         }
         if self.offset.is_some() {
-            return Err(Error::InvalidQuery(
-                "leaf AggregateSumOnRange queries may not set SizedQuery::offset — same \
-                 reason as limit",
-            ));
+            return Err(non_ascii_messages::sum_leaf_offset());
         }
         Ok(())
     }
@@ -415,11 +399,7 @@ impl SizedQuery {
     /// in the proof, and the use case for that hasn't been designed yet.
     fn check_carrier_aggregate_sum_size_constraints(&self) -> Result<(), Error> {
         if self.offset.is_some() {
-            return Err(Error::InvalidQuery(
-                "carrier AggregateSumOnRange queries may not set SizedQuery::offset — \
-                 skipping outer matches changes which (outer_key, i64) pairs end up in the \
-                 proof; the use case for this isn't designed yet",
-            ));
+            return Err(non_ascii_messages::sum_carrier_offset());
         }
         Ok(())
     }
@@ -465,17 +445,10 @@ impl SizedQuery {
     /// change both answers, so both are rejected.
     fn check_leaf_aggregate_count_and_sum_size_constraints(&self) -> Result<(), Error> {
         if self.limit.is_some() {
-            return Err(Error::InvalidQuery(
-                "leaf AggregateCountAndSumOnRange queries may not set SizedQuery::limit — a \
-                 leaf returns a single (u64, i64) and pagination would silently change both \
-                 answers",
-            ));
+            return Err(non_ascii_messages::count_and_sum_leaf_limit());
         }
         if self.offset.is_some() {
-            return Err(Error::InvalidQuery(
-                "leaf AggregateCountAndSumOnRange queries may not set SizedQuery::offset — \
-                 same reason as limit",
-            ));
+            return Err(non_ascii_messages::count_and_sum_leaf_offset());
         }
         Ok(())
     }
@@ -488,11 +461,7 @@ impl SizedQuery {
     /// `SizedQuery::offset` is still rejected.
     fn check_carrier_aggregate_count_and_sum_size_constraints(&self) -> Result<(), Error> {
         if self.offset.is_some() {
-            return Err(Error::InvalidQuery(
-                "carrier AggregateCountAndSumOnRange queries may not set SizedQuery::offset — \
-                 skipping outer matches changes which (outer_key, u64, i64) triples end up in \
-                 the proof; the use case for this isn't designed yet",
-            ));
+            return Err(non_ascii_messages::count_and_sum_carrier_offset());
         }
         Ok(())
     }
@@ -1863,6 +1832,99 @@ impl<'a> SinglePathSubquery<'a> {
             synthesized_path_component: false,
             instance_limit: query_node.limit,
         }
+    }
+}
+
+/// Error values whose messages contain non-ASCII text (an em dash), built
+/// out of line: the extracted Lean model cannot carry such string literals,
+/// so the closure configuration marks this module opaque. The messages are
+/// verbatim; callers return these exactly where they built them before.
+mod non_ascii_messages {
+    use crate::Error;
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn count_leaf_limit() -> Error {
+        Error::InvalidQuery(
+            "leaf AggregateCountOnRange queries may not set SizedQuery::limit — a leaf \
+             returns a single u64 and pagination would silently change the answer",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn count_leaf_offset() -> Error {
+        Error::InvalidQuery(
+            "leaf AggregateCountOnRange queries may not set SizedQuery::offset — same \
+             reason as limit",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn count_carrier_offset() -> Error {
+        Error::InvalidQuery(
+            "carrier AggregateCountOnRange queries may not set SizedQuery::offset — \
+             skipping outer matches changes which (outer_key, u64) pairs end up in the \
+             proof; the use case for this isn't designed yet",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn sum_leaf_limit() -> Error {
+        Error::InvalidQuery(
+            "leaf AggregateSumOnRange queries may not set SizedQuery::limit — a leaf \
+             returns a single i64 and pagination would silently change the answer",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn sum_leaf_offset() -> Error {
+        Error::InvalidQuery(
+            "leaf AggregateSumOnRange queries may not set SizedQuery::offset — same \
+             reason as limit",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn sum_carrier_offset() -> Error {
+        Error::InvalidQuery(
+            "carrier AggregateSumOnRange queries may not set SizedQuery::offset — \
+             skipping outer matches changes which (outer_key, i64) pairs end up in the \
+             proof; the use case for this isn't designed yet",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn count_and_sum_leaf_limit() -> Error {
+        Error::InvalidQuery(
+            "leaf AggregateCountAndSumOnRange queries may not set SizedQuery::limit — a \
+             leaf returns a single (u64, i64) and pagination would silently change both \
+             answers",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn count_and_sum_leaf_offset() -> Error {
+        Error::InvalidQuery(
+            "leaf AggregateCountAndSumOnRange queries may not set SizedQuery::offset — \
+             same reason as limit",
+        )
+    }
+
+    /// `Error::InvalidQuery` with the message below.
+    #[cold]
+    pub(super) fn count_and_sum_carrier_offset() -> Error {
+        Error::InvalidQuery(
+            "carrier AggregateCountAndSumOnRange queries may not set SizedQuery::offset — \
+             skipping outer matches changes which (outer_key, u64, i64) triples end up in \
+             the proof; the use case for this isn't designed yet",
+        )
     }
 }
 
