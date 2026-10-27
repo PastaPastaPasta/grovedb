@@ -21,7 +21,8 @@ use crate::{
     proofs::{
         query::{
             aggregate_common::{
-                classify_subtree, key_strictly_inside, SubtreeClassification, NULL_HASH,
+                classify_subtree, hex_bound, in_range_contribution, key_strictly_inside,
+                SubtreeClassification, NULL_HASH,
             },
             QueryItem,
         },
@@ -247,8 +248,8 @@ fn verify_count_shape(
                     "aggregate-count proof: boundary key {} falls outside its inherited \
                      subtree bounds (lo={:?}, hi={:?})",
                     hex::encode(key),
-                    lo.map(hex::encode),
-                    hi.map(hex::encode),
+                    hex_bound(lo),
+                    hex_bound(hi),
                 )));
             }
             let key_slice = key.as_slice();
@@ -277,11 +278,7 @@ fn verify_count_shape(
                         hex::encode(key)
                     ))
                 })?;
-            let self_contribution = if range.contains(key_slice) {
-                own_count
-            } else {
-                0
-            };
+            let self_contribution = in_range_contribution(range, key_slice, own_count, 0);
             let in_range = left_in
                 .checked_add(right_in)
                 .and_then(|s| s.checked_add(self_contribution))

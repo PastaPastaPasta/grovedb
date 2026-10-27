@@ -30,7 +30,8 @@ use crate::{
     proofs::{
         query::{
             aggregate_common::{
-                classify_subtree, key_strictly_inside, SubtreeClassification, NULL_HASH,
+                classify_subtree, hex_bound, in_range_contribution, key_strictly_inside,
+                SubtreeClassification, NULL_HASH,
             },
             QueryItem,
         },
@@ -235,8 +236,8 @@ fn verify_count_and_sum_shape(
                     "aggregate-count-and-sum proof: boundary key {} falls outside its \
                      inherited subtree bounds (lo={:?}, hi={:?})",
                     hex::encode(key),
-                    lo.map(hex::encode),
-                    hi.map(hex::encode),
+                    hex_bound(lo),
+                    hex_bound(hi),
                 )));
             }
             let key_slice = key.as_slice();
@@ -270,11 +271,8 @@ fn verify_count_and_sum_shape(
             // legal). The hash chain catches any wrong arithmetic via
             // root-hash mismatch.
             let own_sum = agg_sum - left_struct_s - right_struct_s;
-            let (self_count_contribution, self_sum_contribution) = if range.contains(key_slice) {
-                (own_count, own_sum)
-            } else {
-                (0u64, 0i128)
-            };
+            let (self_count_contribution, self_sum_contribution) =
+                in_range_contribution(range, key_slice, (own_count, own_sum), (0u64, 0i128));
             let in_range_count = left_in_c
                 .checked_add(right_in_c)
                 .and_then(|s| s.checked_add(self_count_contribution))

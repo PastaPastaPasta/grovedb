@@ -122,8 +122,44 @@ pub(super) fn classify_subtree(
 /// classification logic would silently miscount/misadd children that
 /// don't actually exist at that position in the tree.
 #[cfg(any(feature = "minimal", feature = "verify"))]
+///
+/// `match` rather than `Option::is_none_or`, to keep closures off the
+/// verifier path.
 pub(super) fn key_strictly_inside(key: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
-    let lo_ok = lo.is_none_or(|l| key > l);
-    let hi_ok = hi.is_none_or(|h| key < h);
+    let lo_ok = match lo {
+        None => true,
+        Some(l) => key > l,
+    };
+    let hi_ok = match hi {
+        None => true,
+        Some(h) => key < h,
+    };
     lo_ok && hi_ok
+}
+
+/// A subtree bound hex-encoded for an error message
+/// (`bound.map(hex::encode)`), as a `match`: the extracted model has no
+/// function values.
+#[cfg(any(feature = "minimal", feature = "verify"))]
+#[allow(clippy::manual_map)] // `Option::map` is what this avoids
+pub(super) fn hex_bound(bound: Option<&[u8]>) -> Option<String> {
+    match bound {
+        Some(key) => Some(hex::encode(key)),
+        None => None,
+    }
+}
+
+/// A `Boundary` node's own contribution to the in-range aggregate: `own`
+/// when `range` contains the node's `key`, else `zero`.
+///
+/// A function of its own so the extracted shape walks join the two
+/// branches here, not inside their `Boundary` arm (where the join over the
+/// borrowed node key does not translate).
+#[cfg(any(feature = "minimal", feature = "verify"))]
+pub(super) fn in_range_contribution<T>(range: &QueryItem, key: &[u8], own: T, zero: T) -> T {
+    if range.contains(key) {
+        own
+    } else {
+        zero
+    }
 }

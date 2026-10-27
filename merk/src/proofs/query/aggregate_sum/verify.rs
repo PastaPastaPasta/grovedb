@@ -30,7 +30,8 @@ use crate::{
     proofs::{
         query::{
             aggregate_common::{
-                classify_subtree, key_strictly_inside, SubtreeClassification, NULL_HASH,
+                classify_subtree, hex_bound, in_range_contribution, key_strictly_inside,
+                SubtreeClassification, NULL_HASH,
             },
             QueryItem,
         },
@@ -250,8 +251,8 @@ fn verify_sum_shape(
                     "aggregate-sum proof: boundary key {} falls outside its inherited \
                      subtree bounds (lo={:?}, hi={:?})",
                     hex::encode(key),
-                    lo.map(hex::encode),
-                    hi.map(hex::encode),
+                    hex_bound(lo),
+                    hex_bound(hi),
                 )));
             }
             let key_slice = key.as_slice();
@@ -272,11 +273,7 @@ fn verify_sum_shape(
             // the reconstructed root hash.
             let aggregate_i128 = aggregate as i128;
             let own_sum = aggregate_i128 - left_struct - right_struct;
-            let self_contribution = if range.contains(key_slice) {
-                own_sum
-            } else {
-                0
-            };
+            let self_contribution = in_range_contribution(range, key_slice, own_sum, 0);
             let in_range = left_in + right_in + self_contribution;
             Ok((in_range, aggregate_i128))
         }
