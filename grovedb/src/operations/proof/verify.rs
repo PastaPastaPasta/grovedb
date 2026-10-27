@@ -4386,25 +4386,10 @@ impl GroveDb {
                 "range and element sub-proofs derived different root hashes".to_string(),
             ));
         }
-        let total_count = match element_results.as_slice() {
-            [(_, element_key, Some(element))] if element_key.as_slice() == key => {
-                match element.underlying() {
-                    Element::BulkAppendTree(total_count, _, _)
-                    | Element::CommitmentTree(total_count, _, _) => *total_count,
-                    _ => {
-                        return Err(Error::InvalidProof(
-                            range_query,
-                            "element at path/key is not a BulkAppendTree or CommitmentTree"
-                                .to_string(),
-                        ));
-                    }
-                }
-            }
-            _ => {
-                return Err(Error::InvalidProof(
-                    range_query,
-                    "proof does not bind the append-only element at path/key".to_string(),
-                ));
+        let total_count = match bound_append_only_total_count(&element_results, key) {
+            Ok(total_count) => total_count,
+            Err(message) => {
+                return Err(Error::InvalidProof(range_query, message.to_string()));
             }
         };
 
@@ -4417,46 +4402,7 @@ impl GroveDb {
             .saturating_add(limit as u64)
             .min(total_count)
             .max(start);
-        let mut entries = Vec::with_capacity((end - start) as usize);
-        let mut expected_position = start;
-        for (_, position_key, element) in results {
-            let position_bytes: [u8; 8] = position_key.as_slice().try_into().map_err(|_| {
-                Error::InvalidProof(
-                    range_query.clone(),
-                    "range entry key is not an 8-byte big-endian position".to_string(),
-                )
-            })?;
-            let position = u64::from_be_bytes(position_bytes);
-            let value = match element {
-                Some(Element::Item(value, _)) => value,
-                _ => {
-                    return Err(Error::InvalidProof(
-                        range_query,
-                        format!("range entry at position {} is not an item", position),
-                    ));
-                }
-            };
-            if position != expected_position {
-                return Err(Error::InvalidProof(
-                    range_query,
-                    format!(
-                        "range entries not contiguous: expected position {}, got {}",
-                        expected_position, position
-                    ),
-                ));
-            }
-            expected_position += 1;
-            entries.push((position, value));
-        }
-        if expected_position != end {
-            return Err(Error::InvalidProof(
-                range_query,
-                format!(
-                    "range proof incomplete: expected positions [{}, {}), got up to {}",
-                    start, end, expected_position
-                ),
-            ));
-        }
+        let entries = bulk_range_entries(&results, start, end, &range_query)?;
 
         Ok((
             root_hash,
@@ -5435,6 +5381,313 @@ impl GroveDb {
             branch_root_hash,
             tree: branch_tree,
         })
+    }
+}
+
+/// The `total_count` of the append-only element the single-key subset
+/// query proved: the result must be exactly one row, for `key`, with a
+/// present `BulkAppendTree` or `CommitmentTree` (wrappers looked through).
+/// The error is the rejection message. Written without the slice pattern
+/// `[(_, element_key, Some(element))]`, which the extraction cannot
+/// translate.
+fn bound_append_only_total_count(
+    element_results: &[PathKeyOptionalElementTrio],
+    key: &[u8],
+) -> Result<u64, &'static str> {
+    const NOT_BOUND: &str = "proof does not bind the append-only element at path/key";
+    if element_results.len() != 1 {
+        return Err(NOT_BOUND);
+    }
+    let (_, element_key, element) = &element_results[0];
+    let element = match element {
+        Some(element) => element,
+        None => return Err(NOT_BOUND),
+    };
+    if element_key.as_slice() != key {
+        return Err(NOT_BOUND);
+    }
+    match element.underlying() {
+        Element::BulkAppendTree(total_count, _, _) | Element::CommitmentTree(total_count, _, _) => {
+            Ok(*total_count)
+        }
+        _ => Err("element at path/key is not a BulkAppendTree or CommitmentTree"),
+    }
+}
+
+/// The `(position, value)` entries of a verified bulk position range,
+/// requiring them to be exactly `[start, end)`: ascending, contiguous,
+/// complete. Each result row is checked by [`bulk_range_entry`], in
+/// order, and the first failing row's error is returned; an index loop
+/// whose body never returns early.
+fn bulk_range_entries(
+    results: &[PathKeyOptionalElementTrio],
+    start: u64,
+    end: u64,
+    range_query: &PathQuery,
+) -> Result<Vec<(u64, Vec<u8>)>, Error> {
+    let mut entries = Vec::with_capacity((end - start) as usize);
+    let mut expected_position = start;
+    let mut failure = None;
+    let mut failed = false;
+    let mut i = 0;
+    while i < results.len() && !failed {
+        match bulk_range_entry(&results[i], expected_position, range_query) {
+            Ok(entry) => {
+                expected_position += 1;
+                entries.push(entry);
+            }
+            Err(e) => {
+                failure = Some(e);
+                failed = true;
+            }
+        }
+        i += 1;
+    }
+    if let Some(e) = failure {
+        return Err(e);
+    }
+    if expected_position != end {
+        return Err(Error::InvalidProof(
+            range_query.clone(),
+            format!(
+                "range proof incomplete: expected positions [{}, {}), got up to {}",
+                start, end, expected_position
+            ),
+        ));
+    }
+    Ok(entries)
+}
+
+/// One row of [`bulk_range_entries`]: its key must be an 8-byte
+/// big-endian position, its element an item, and its position
+/// `expected_position`.
+fn bulk_range_entry(
+    row: &PathKeyOptionalElementTrio,
+    expected_position: u64,
+    range_query: &PathQuery,
+) -> Result<(u64, Vec<u8>), Error> {
+    let (_, position_key, element) = row;
+    let position = match be_u64(position_key) {
+        Some(position) => position,
+        None => {
+            return Err(Error::InvalidProof(
+                range_query.clone(),
+                "range entry key is not an 8-byte big-endian position".to_string(),
+            ));
+        }
+    };
+    let value = match element {
+        Some(Element::Item(value, _)) => value.clone(),
+        _ => {
+            return Err(Error::InvalidProof(
+                range_query.clone(),
+                format!("range entry at position {} is not an item", position),
+            ));
+        }
+    };
+    if position != expected_position {
+        return Err(Error::InvalidProof(
+            range_query.clone(),
+            format!(
+                "range entries not contiguous: expected position {}, got {}",
+                expected_position, position
+            ),
+        ));
+    }
+    Ok((position, value))
+}
+
+/// `bytes` as a big-endian `u64` when it is exactly 8 bytes long, else
+/// `None`: `<[u8; 8]>::try_from(bytes).map(u64::from_be_bytes)`, spelled
+/// out because the extraction models neither.
+fn be_u64(bytes: &[u8]) -> Option<u64> {
+    if bytes.len() != 8 {
+        return None;
+    }
+    let mut value = 0u64;
+    let mut i = 0;
+    while i < 8 {
+        value = (value << 8) | bytes[i] as u64;
+        i += 1;
+    }
+    Some(value)
+}
+
+/// The bulk position-range row checks were lifted out of
+/// `verify_bulk_position_range_proof` for the Rust-to-Lean extraction.
+/// `ref_bulk_range_entries` is the previous loop and completeness check,
+/// verbatim, wrapped in a function of its inputs.
+#[cfg(test)]
+mod bulk_range_reference_tests {
+    use super::*;
+
+    fn ref_bulk_range_entries(
+        results: Vec<PathKeyOptionalElementTrio>,
+        start: u64,
+        end: u64,
+        range_query: PathQuery,
+    ) -> Result<Vec<(u64, Vec<u8>)>, Error> {
+        let mut entries = Vec::with_capacity((end - start) as usize);
+        let mut expected_position = start;
+        for (_, position_key, element) in results {
+            let position_bytes: [u8; 8] = position_key.as_slice().try_into().map_err(|_| {
+                Error::InvalidProof(
+                    range_query.clone(),
+                    "range entry key is not an 8-byte big-endian position".to_string(),
+                )
+            })?;
+            let position = u64::from_be_bytes(position_bytes);
+            let value = match element {
+                Some(Element::Item(value, _)) => value,
+                _ => {
+                    return Err(Error::InvalidProof(
+                        range_query,
+                        format!("range entry at position {} is not an item", position),
+                    ));
+                }
+            };
+            if position != expected_position {
+                return Err(Error::InvalidProof(
+                    range_query,
+                    format!(
+                        "range entries not contiguous: expected position {}, got {}",
+                        expected_position, position
+                    ),
+                ));
+            }
+            expected_position += 1;
+            entries.push((position, value));
+        }
+        if expected_position != end {
+            return Err(Error::InvalidProof(
+                range_query,
+                format!(
+                    "range proof incomplete: expected positions [{}, {}), got up to {}",
+                    start, end, expected_position
+                ),
+            ));
+        }
+        Ok(entries)
+    }
+
+    fn row(key: Vec<u8>, element: Option<Element>) -> PathKeyOptionalElementTrio {
+        (vec![b"p".to_vec()], key, element)
+    }
+
+    /// Rows over a few start positions: valid runs, gaps, repeats, short
+    /// and long keys, and non-item elements.
+    fn row_lists(start: u64) -> Vec<Vec<PathKeyOptionalElementTrio>> {
+        let pos = |p: u64| p.to_be_bytes().to_vec();
+        let item = |v: u8| Some(Element::new_item(vec![v]));
+        let mut lists = Vec::new();
+        for n in 0..4u64 {
+            lists.push(
+                (0..n)
+                    .map(|i| row(pos(start.wrapping_add(i)), item(i as u8)))
+                    .collect(),
+            );
+        }
+        lists.push(vec![row(pos(start.wrapping_add(1)), item(0))]);
+        lists.push(vec![row(pos(start), item(0)), row(pos(start), item(1))]);
+        lists.push(vec![row(pos(start)[1..].to_vec(), item(0))]);
+        lists.push(vec![row([pos(start), vec![0]].concat(), item(0))]);
+        lists.push(vec![row(pos(start), None)]);
+        lists.push(vec![row(pos(start), Some(Element::empty_tree()))]);
+        lists.push(vec![row(pos(start), item(0)), row(vec![1, 2], None)]);
+        lists.push(vec![
+            row(pos(start), item(0)),
+            row(pos(start.wrapping_add(5)), None),
+        ]);
+        lists
+    }
+
+    #[test]
+    fn bulk_range_entries_match_reference() {
+        let range_query = PathQuery::new_single_key(vec![b"p".to_vec()], b"k".to_vec());
+        for start in [0u64, 7, u64::MAX - 3] {
+            for end in [start, start + 1, start + 2, start + 3] {
+                for rows in row_lists(start) {
+                    let got = bulk_range_entries(&rows, start, end, &range_query);
+                    let want =
+                        ref_bulk_range_entries(rows.clone(), start, end, range_query.clone());
+                    assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "{start} {end} {rows:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The previous `total_count` match, verbatim, with its two `return`
+    /// statements yielding the message instead.
+    fn ref_total_count(
+        element_results: Vec<PathKeyOptionalElementTrio>,
+        key: &[u8],
+    ) -> Result<u64, &'static str> {
+        let total_count = match element_results.as_slice() {
+            [(_, element_key, Some(element))] if element_key.as_slice() == key => {
+                match element.underlying() {
+                    Element::BulkAppendTree(total_count, _, _)
+                    | Element::CommitmentTree(total_count, _, _) => *total_count,
+                    _ => {
+                        return Err(
+                            "element at path/key is not a BulkAppendTree or CommitmentTree",
+                        );
+                    }
+                }
+            }
+            _ => {
+                return Err("proof does not bind the append-only element at path/key");
+            }
+        };
+        Ok(total_count)
+    }
+
+    #[test]
+    fn bound_total_count_matches_reference() {
+        let elements = [
+            None,
+            Some(Element::BulkAppendTree(5, 2, None)),
+            Some(Element::CommitmentTree(7, 2, None)),
+            Some(Element::new_item(vec![1])),
+            Some(Element::empty_tree()),
+            Some(Element::NonCounted(Box::new(Element::BulkAppendTree(
+                9, 2, None,
+            )))),
+        ];
+        let keys: [&[u8]; 2] = [b"k", b"j"];
+        let mut lists: Vec<Vec<PathKeyOptionalElementTrio>> = vec![vec![]];
+        for e in &elements {
+            for k in keys {
+                lists.push(vec![(vec![], k.to_vec(), e.clone())]);
+                lists.push(vec![
+                    (vec![], k.to_vec(), e.clone()),
+                    (vec![], b"k".to_vec(), e.clone()),
+                ]);
+            }
+        }
+        for rows in lists {
+            assert_eq!(
+                bound_append_only_total_count(&rows, b"k"),
+                ref_total_count(rows.clone(), b"k"),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn be_u64_matches_from_be_bytes() {
+        let bytes: Vec<u8> = (1..=10).collect();
+        for len in 0..=bytes.len() {
+            for offset in 0..=(bytes.len() - len) {
+                let slice = &bytes[offset..offset + len];
+                let want: Option<u64> = <[u8; 8]>::try_from(slice).ok().map(u64::from_be_bytes);
+                assert_eq!(be_u64(slice), want, "{slice:?}");
+            }
+        }
+        assert_eq!(be_u64(&[0xff; 8]), Some(u64::MAX));
     }
 }
 
