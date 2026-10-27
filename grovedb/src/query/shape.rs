@@ -347,8 +347,11 @@ impl PathQuery {
                     ));
                 }
                 let branch = &query.default_subquery_branch;
-                let Some(suffix) = branch.subquery_path.as_deref() else {
-                    return Err(non_ascii_messages::branched_missing_suffix());
+                // `match` rather than `Option::as_deref`, which the
+                // extraction cannot translate on a `Vec`.
+                let suffix: &[Vec<u8>] = match &branch.subquery_path {
+                    Some(path) => path.as_slice(),
+                    None => return Err(non_ascii_messages::branched_missing_suffix()),
                 };
                 if suffix.is_empty() || any_empty_segment(suffix) {
                     return Err(Error::InvalidQuery(
@@ -483,7 +486,12 @@ fn has_repeated_key_item(items: &[QueryItem]) -> bool {
     let mut i = 0;
     while i < items.len() && !repeated {
         if let QueryItem::Key(key) = &items[i] {
-            repeated = !seen.insert(key.clone());
+            // `match` rather than `!`: the extraction renders `!` on this
+            // `bool` as a proposition.
+            repeated = match seen.insert(key.clone()) {
+                true => false,
+                false => true,
+            };
         }
         i += 1;
     }

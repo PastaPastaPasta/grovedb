@@ -37,12 +37,12 @@ pub(crate) struct ValidatedPathQuery<'q> {
 
 impl<'q> ValidatedPathQuery<'q> {
     pub(crate) fn new(
-        query: &'q PathQuery,
+        path_query: &'q PathQuery,
         grove_version: &'q GroveVersion,
     ) -> Result<Self, Error> {
         Ok(Self {
-            query,
-            shape: query.classify()?,
+            query: path_query,
+            shape: path_query.classify()?,
             grove_version,
         })
     }
@@ -154,10 +154,10 @@ impl<'q> ValidatedPathQuery<'q> {
     }
 
     pub(crate) fn for_verification(
-        query: &'q PathQuery,
+        path_query: &'q PathQuery,
         grove_version: &'q GroveVersion,
     ) -> Result<Self, Error> {
-        let validated = Self::new(query, grove_version)?;
+        let validated = Self::new(path_query, grove_version)?;
         validated.check_proof_capabilities(false)?;
         Ok(validated)
     }
