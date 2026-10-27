@@ -1928,6 +1928,159 @@ mod non_ascii_messages {
     }
 }
 
+/// The `SizedQuery` limit/offset checks whose em-dash messages moved into
+/// `non_ascii_messages`: each `ref_` function is the previous body, verbatim
+/// except for its name and `sq` for `self`. Both must give the same result,
+/// message included, for every limit/offset combination.
+#[cfg(test)]
+mod size_constraint_reference_tests {
+    use super::*;
+
+    fn ref_check_leaf_aggregate_count_size_constraints(sq: &SizedQuery) -> Result<(), Error> {
+        if sq.limit.is_some() {
+            return Err(Error::InvalidQuery(
+                "leaf AggregateCountOnRange queries may not set SizedQuery::limit — a leaf \
+                 returns a single u64 and pagination would silently change the answer",
+            ));
+        }
+        if sq.offset.is_some() {
+            return Err(Error::InvalidQuery(
+                "leaf AggregateCountOnRange queries may not set SizedQuery::offset — same \
+                 reason as limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ref_check_carrier_aggregate_count_size_constraints(sq: &SizedQuery) -> Result<(), Error> {
+        if sq.offset.is_some() {
+            return Err(Error::InvalidQuery(
+                "carrier AggregateCountOnRange queries may not set SizedQuery::offset — \
+                 skipping outer matches changes which (outer_key, u64) pairs end up in the \
+                 proof; the use case for this isn't designed yet",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ref_check_leaf_aggregate_sum_size_constraints(sq: &SizedQuery) -> Result<(), Error> {
+        if sq.limit.is_some() {
+            return Err(Error::InvalidQuery(
+                "leaf AggregateSumOnRange queries may not set SizedQuery::limit — a leaf \
+                 returns a single i64 and pagination would silently change the answer",
+            ));
+        }
+        if sq.offset.is_some() {
+            return Err(Error::InvalidQuery(
+                "leaf AggregateSumOnRange queries may not set SizedQuery::offset — same \
+                 reason as limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ref_check_carrier_aggregate_sum_size_constraints(sq: &SizedQuery) -> Result<(), Error> {
+        if sq.offset.is_some() {
+            return Err(Error::InvalidQuery(
+                "carrier AggregateSumOnRange queries may not set SizedQuery::offset — \
+                 skipping outer matches changes which (outer_key, i64) pairs end up in the \
+                 proof; the use case for this isn't designed yet",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ref_check_leaf_aggregate_count_and_sum_size_constraints(
+        sq: &SizedQuery,
+    ) -> Result<(), Error> {
+        if sq.limit.is_some() {
+            return Err(Error::InvalidQuery(
+                "leaf AggregateCountAndSumOnRange queries may not set SizedQuery::limit — a \
+                 leaf returns a single (u64, i64) and pagination would silently change both \
+                 answers",
+            ));
+        }
+        if sq.offset.is_some() {
+            return Err(Error::InvalidQuery(
+                "leaf AggregateCountAndSumOnRange queries may not set SizedQuery::offset — \
+                 same reason as limit",
+            ));
+        }
+        Ok(())
+    }
+
+    fn ref_check_carrier_aggregate_count_and_sum_size_constraints(
+        sq: &SizedQuery,
+    ) -> Result<(), Error> {
+        if sq.offset.is_some() {
+            return Err(Error::InvalidQuery(
+                "carrier AggregateCountAndSumOnRange queries may not set SizedQuery::offset — \
+                 skipping outer matches changes which (outer_key, u64, i64) triples end up in \
+                 the proof; the use case for this isn't designed yet",
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn size_constraint_checks_match_reference() {
+        let bounds = [None, Some(0), Some(1), Some(7)];
+        for limit in bounds {
+            for offset in bounds {
+                let sq = SizedQuery::new(Query::new(), limit, offset);
+                assert_eq!(
+                    format!("{:?}", sq.check_leaf_aggregate_count_size_constraints()),
+                    format!("{:?}", ref_check_leaf_aggregate_count_size_constraints(&sq)),
+                    "check_leaf_aggregate_count_size_constraints {limit:?} {offset:?}"
+                );
+                assert_eq!(
+                    format!("{:?}", sq.check_carrier_aggregate_count_size_constraints()),
+                    format!(
+                        "{:?}",
+                        ref_check_carrier_aggregate_count_size_constraints(&sq)
+                    ),
+                    "check_carrier_aggregate_count_size_constraints {limit:?} {offset:?}"
+                );
+                assert_eq!(
+                    format!("{:?}", sq.check_leaf_aggregate_sum_size_constraints()),
+                    format!("{:?}", ref_check_leaf_aggregate_sum_size_constraints(&sq)),
+                    "check_leaf_aggregate_sum_size_constraints {limit:?} {offset:?}"
+                );
+                assert_eq!(
+                    format!("{:?}", sq.check_carrier_aggregate_sum_size_constraints()),
+                    format!(
+                        "{:?}",
+                        ref_check_carrier_aggregate_sum_size_constraints(&sq)
+                    ),
+                    "check_carrier_aggregate_sum_size_constraints {limit:?} {offset:?}"
+                );
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        sq.check_leaf_aggregate_count_and_sum_size_constraints()
+                    ),
+                    format!(
+                        "{:?}",
+                        ref_check_leaf_aggregate_count_and_sum_size_constraints(&sq)
+                    ),
+                    "check_leaf_aggregate_count_and_sum_size_constraints {limit:?} {offset:?}"
+                );
+                assert_eq!(
+                    format!(
+                        "{:?}",
+                        sq.check_carrier_aggregate_count_and_sum_size_constraints()
+                    ),
+                    format!(
+                        "{:?}",
+                        ref_check_carrier_aggregate_count_and_sum_size_constraints(&sq)
+                    ),
+                    "check_carrier_aggregate_count_and_sum_size_constraints {limit:?} {offset:?}"
+                );
+            }
+        }
+    }
+}
+
 #[cfg(feature = "minimal")]
 #[cfg(test)]
 mod tests {
