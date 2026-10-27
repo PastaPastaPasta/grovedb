@@ -26,10 +26,13 @@ use crate::{
 /// A query and its validated, allocation-free shape at a particular version.
 /// Aggregate kind and inner range are retained in `shape`, not rediscovered
 /// from the query by consumers. This type is deliberately not serialized.
+///
+/// `query` is declared last: in the extracted Lean structure a field named
+/// `query` would shadow the `query` namespace in the types of later fields.
 pub(crate) struct ValidatedPathQuery<'q> {
-    query: &'q PathQuery,
     shape: PathQueryShape<'q>,
     grove_version: &'q GroveVersion,
+    query: &'q PathQuery,
 }
 
 impl<'q> ValidatedPathQuery<'q> {
