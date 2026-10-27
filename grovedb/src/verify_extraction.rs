@@ -3,11 +3,10 @@
 //! Compiled only with the `verify-extraction` feature, which is in no default
 //! or production feature set (CI's `--all-features` builds compile and lint
 //! it; nothing calls it). Not a stable API. The toolchain (Charon + Aeneas)
-//! translates this crate's
-//! own functions and everything they call, so these one-line forwards make
-//! Merk's public query-proof entry points part of what it translates. Each
-//! returns exactly what the Merk function returns; the theorems are stated
-//! about the Merk functions themselves.
+//! translates this crate's own functions and everything they call, so these
+//! one-line forwards make Merk's public query-proof entry points part of what
+//! it translates. Each returns exactly what the Merk function returns; the
+//! theorems are stated about the Merk functions themselves.
 
 use grovedb_costs::CostResult;
 use grovedb_merk::{

@@ -497,7 +497,7 @@ impl GroveDb {
     /// be present because we are querying in a subtree
     pub fn verify_query_get_parent_tree_info_with_options(
         proof: &[u8],
-        query: &PathQuery,
+        path_query: &PathQuery,
         options: VerifyOptions,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, TreeFeatureType, Vec<PathKeyOptionalElementTrio>), Error> {
@@ -510,14 +510,14 @@ impl GroveDb {
                 .verify_query_get_parent_tree_info_with_options
         );
 
-        if query.query.query.has_subquery() {
+        if path_query.query.query.has_subquery() {
             return Err(Error::NotSupported(
                 "getting the parent tree info is not available when using subqueries".to_string(),
             ));
         }
         if options.absence_proofs_for_non_existing_searched_keys {
             // must have a limit
-            query.query.limit.ok_or(Error::NotSupported(
+            path_query.query.limit.ok_or(Error::NotSupported(
                 "limits must be set in verify_query_with_absence_proof".to_string(),
             ))?;
         }
@@ -529,19 +529,19 @@ impl GroveDb {
         // provable count tree verifies here too (issue #707).
 
         // Pre-decode query-shape gate — see `verify_query_with_options`.
-        query.reject_unserved_per_instance_limits(grove_version)?;
+        path_query.reject_unserved_per_instance_limits(grove_version)?;
         if options.absence_proofs_for_non_existing_searched_keys {
-            query.reject_per_instance_limits("absence-proof verification")?;
-            query.reject_absence_proofs_with_offset()?;
+            path_query.reject_per_instance_limits("absence-proof verification")?;
+            path_query.reject_absence_proofs_with_offset()?;
         }
 
         let grovedb_proof = super::decode_grovedb_proof_canonical(proof)?;
 
         let (root_hash, tree_feature_type, result) =
-            Self::verify_proof_internal(&grovedb_proof, query, options, grove_version)?;
+            Self::verify_proof_internal(&grovedb_proof, path_query, options, grove_version)?;
 
         let tree_feature_type = tree_feature_type.ok_or(Error::InvalidProof(
-            query.clone(),
+            path_query.clone(),
             "query had no parent tree info, maybe it was for for root tree".to_string(),
         ))?;
 
@@ -552,7 +552,7 @@ impl GroveDb {
     /// with raw (not deserialized) proved key-value results.
     pub fn verify_query_raw(
         proof: &[u8],
-        query: &PathQuery,
+        path_query: &PathQuery,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, ProvedPathKeyValues), Error> {
         check_grovedb_v0!(
@@ -564,13 +564,13 @@ impl GroveDb {
                 .verify_query_raw
         );
         // Pre-decode query-shape gate — see `verify_query_with_options`.
-        query.reject_unserved_per_instance_limits(grove_version)?;
+        path_query.reject_unserved_per_instance_limits(grove_version)?;
 
         let grovedb_proof = super::decode_grovedb_proof_canonical(proof)?;
 
         let (root_hash, _, result) = Self::verify_proof_raw_internal(
             &grovedb_proof,
-            query,
+            path_query,
             VerifyOptions {
                 absence_proofs_for_non_existing_searched_keys: false,
                 verify_proof_succinctness: false,
@@ -758,32 +758,32 @@ impl GroveDb {
 
     pub(crate) fn verify_proof_raw_internal(
         proof: &GroveDBProof,
-        query: &PathQuery,
+        path_query: &PathQuery,
         options: VerifyOptions,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, Option<TreeFeatureType>, ProvedPathKeyValues), Error> {
         // Same fail-closed read-mode and per-instance-limit gates as
         // `verify_proof_internal`.
-        query.reject_unserved_read_mode()?;
-        query.reject_unserved_per_instance_limits(grove_version)?;
+        path_query.reject_unserved_read_mode()?;
+        path_query.reject_unserved_per_instance_limits(grove_version)?;
         if options.absence_proofs_for_non_existing_searched_keys {
-            query.reject_per_instance_limits("absence-proof verification")?;
-            query.reject_absence_proofs_with_offset()?;
+            path_query.reject_per_instance_limits("absence-proof verification")?;
+            path_query.reject_absence_proofs_with_offset()?;
         }
 
         // Same V0-rejects / V1-relaxes envelope gate as
         // `verify_proof_internal` — see `apply_count_offset_envelope_gate`.
-        Self::apply_count_offset_envelope_gate(proof, query)?;
+        Self::apply_count_offset_envelope_gate(proof, path_query)?;
 
         match proof {
             GroveDBProof::V0(proof_v0) => {
                 // See `verify_proof_internal`: V0 predates per-instance
                 // caps.
-                query.reject_per_instance_limits("the V0 verifier")?;
-                Self::verify_proof_raw_internal_v0(proof_v0, query, options, grove_version)
+                path_query.reject_per_instance_limits("the V0 verifier")?;
+                Self::verify_proof_raw_internal_v0(proof_v0, path_query, options, grove_version)
             }
             GroveDBProof::V1(proof_v1) => {
-                Self::verify_proof_v1_raw_internal(proof_v1, query, options, grove_version)
+                Self::verify_proof_v1_raw_internal(proof_v1, path_query, options, grove_version)
             }
         }
     }
