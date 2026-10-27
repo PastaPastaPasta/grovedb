@@ -6761,12 +6761,28 @@ mod chunk_proof_reference_tests {
             }
         }
         let mut branch_cases = 0;
+        let mut proved = [0usize; 2];
         for query in &queries {
-            for grove_version in [latest, &GROVE_V1] {
+            for (prover, grove_version) in [latest, &GROVE_V1].into_iter().enumerate() {
                 let Ok(proof) = db.prove_trunk_chunk(query, grove_version).unwrap() else {
                     continue;
                 };
+                proved[prover] += 1;
                 compare_trunk_family(&proof, query, latest);
+                // The same proof against an empty path and a zero chunk
+                // depth, which the provers never produce.
+                let empty_path = PathTrunkChunkQuery {
+                    path: Vec::new(),
+                    max_depth: query.max_depth,
+                    min_depth: None,
+                };
+                compare_trunk(&proof, &empty_path, latest);
+                let zero_depth = PathTrunkChunkQuery {
+                    path: query.path.clone(),
+                    max_depth: 0,
+                    min_depth: None,
+                };
+                compare_trunk(&proof, &zero_depth, latest);
                 // Branches off the trunk's leaf keys, with the right and a
                 // wrong expected hash, and mutated proofs.
                 let Ok((_, trunk)) = GroveDb::verify_trunk_chunk_proof(&proof, query, latest)
@@ -6806,6 +6822,9 @@ mod chunk_proof_reference_tests {
                 }
             }
         }
+        // Both provers (V1 envelopes at latest, V0 at GROVE_V1) proved every
+        // count-tree query: 4 trees x 2 parents x 3 depths.
+        assert_eq!(proved, [24, 24]);
         assert!(branch_cases > 100, "{branch_cases}");
     }
 }
