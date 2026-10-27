@@ -97,9 +97,9 @@ impl fmt::Display for SizedQuery {
 
 impl SizedQuery {
     /// New sized query
-    pub const fn new(query: Query, limit: Option<u16>, offset: Option<u16>) -> Self {
+    pub const fn new(query_node: Query, limit: Option<u16>, offset: Option<u16>) -> Self {
         Self {
-            query,
+            query: query_node,
             limit,
             offset,
         }
@@ -529,9 +529,9 @@ impl PathQuery {
     }
 
     /// New unsized path query
-    pub const fn new_unsized(path: Vec<Vec<u8>>, query: Query) -> Self {
-        let query = SizedQuery::new(query, None, None);
-        Self { path, query }
+    pub const fn new_unsized(path: Vec<Vec<u8>>, query_node: Query) -> Self {
+        let sized = SizedQuery::new(query_node, None, None);
+        Self { path, query: sized }
     }
 
     /// Canonical `PathQuery` for a paginated position-range read of an

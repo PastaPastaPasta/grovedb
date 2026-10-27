@@ -5166,7 +5166,7 @@ impl GroveDb {
     fn trunk_target_v1(
         target_merk_bytes: &[u8],
         count: u64,
-        query: &PathTrunkChunkQuery,
+        trunk_query: &PathTrunkChunkQuery,
         current_path: &[Vec<u8>],
     ) -> Result<(CryptoHash, Option<grovedb_merk::proofs::tree::Tree>), Error> {
         if count == 0 {
@@ -5182,7 +5182,7 @@ impl GroveDb {
             return Ok((NULL_HASH, None));
         }
         let tree_depth = calculate_max_tree_depth_from_count(count);
-        if let Err(e) = calculate_chunk_depths(tree_depth, query.max_depth) {
+        if let Err(e) = calculate_chunk_depths(tree_depth, trunk_query.max_depth) {
             return Err(Error::CorruptedData(format!(
                 "invalid chunk depth parameters: {}",
                 e
