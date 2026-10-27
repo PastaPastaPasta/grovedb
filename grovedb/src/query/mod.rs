@@ -157,10 +157,10 @@ impl SizedQuery {
         } else if self.query.has_aggregate_count_on_range_anywhere() {
             self.check_carrier_aggregate_count_size_constraints()?;
         }
-        self.query
-            .validate_aggregate_count_on_range()
-            .map_err(query_validation_error_to_static_str)
-            .map_err(Error::InvalidQuery)
+        match self.query.validate_aggregate_count_on_range() {
+            Ok(item) => Ok(item),
+            Err(e) => Err(Error::InvalidQuery(query_validation_error_to_static_str(e))),
+        }
     }
 
     /// Strict variant of [`Self::validate_aggregate_count_on_range`] that
@@ -172,10 +172,10 @@ impl SizedQuery {
     pub fn validate_leaf_aggregate_count_on_range(&self) -> Result<&QueryItem, Error> {
         self.reject_instance_limits_for_aggregates()?;
         self.check_leaf_aggregate_count_size_constraints()?;
-        self.query
-            .validate_leaf_aggregate_count_on_range()
-            .map_err(query_validation_error_to_static_str)
-            .map_err(Error::InvalidQuery)
+        match self.query.validate_leaf_aggregate_count_on_range() {
+            Ok(item) => Ok(item),
+            Err(e) => Err(Error::InvalidQuery(query_validation_error_to_static_str(e))),
+        }
     }
 
     /// Size-constraint check used for **leaf** `AggregateCountOnRange`
@@ -362,10 +362,12 @@ impl SizedQuery {
         } else if self.query.has_aggregate_sum_on_range_anywhere() {
             self.check_carrier_aggregate_sum_size_constraints()?;
         }
-        self.query
-            .validate_aggregate_sum_on_range()
-            .map_err(sum_query_validation_error_to_static_str)
-            .map_err(Error::InvalidQuery)
+        match self.query.validate_aggregate_sum_on_range() {
+            Ok(item) => Ok(item),
+            Err(e) => Err(Error::InvalidQuery(
+                sum_query_validation_error_to_static_str(e),
+            )),
+        }
     }
 
     /// Strict variant of [`Self::validate_aggregate_sum_on_range`] that
@@ -377,10 +379,12 @@ impl SizedQuery {
     pub fn validate_leaf_aggregate_sum_on_range(&self) -> Result<&QueryItem, Error> {
         self.reject_instance_limits_for_aggregates()?;
         self.check_leaf_aggregate_sum_size_constraints()?;
-        self.query
-            .validate_leaf_aggregate_sum_on_range()
-            .map_err(sum_query_validation_error_to_static_str)
-            .map_err(Error::InvalidQuery)
+        match self.query.validate_leaf_aggregate_sum_on_range() {
+            Ok(item) => Ok(item),
+            Err(e) => Err(Error::InvalidQuery(
+                sum_query_validation_error_to_static_str(e),
+            )),
+        }
     }
 
     /// Size-constraint check used for **leaf** `AggregateSumOnRange`
@@ -432,10 +436,12 @@ impl SizedQuery {
         } else if self.query.has_aggregate_count_and_sum_on_range_anywhere() {
             self.check_carrier_aggregate_count_and_sum_size_constraints()?;
         }
-        self.query
-            .validate_aggregate_count_and_sum_on_range()
-            .map_err(count_and_sum_query_validation_error_to_static_str)
-            .map_err(Error::InvalidQuery)
+        match self.query.validate_aggregate_count_and_sum_on_range() {
+            Ok(item) => Ok(item),
+            Err(e) => Err(Error::InvalidQuery(
+                count_and_sum_query_validation_error_to_static_str(e),
+            )),
+        }
     }
 
     /// Strict variant of
@@ -445,10 +451,12 @@ impl SizedQuery {
     pub fn validate_leaf_aggregate_count_and_sum_on_range(&self) -> Result<&QueryItem, Error> {
         self.reject_instance_limits_for_aggregates()?;
         self.check_leaf_aggregate_count_and_sum_size_constraints()?;
-        self.query
-            .validate_leaf_aggregate_count_and_sum_on_range()
-            .map_err(count_and_sum_query_validation_error_to_static_str)
-            .map_err(Error::InvalidQuery)
+        match self.query.validate_leaf_aggregate_count_and_sum_on_range() {
+            Ok(item) => Ok(item),
+            Err(e) => Err(Error::InvalidQuery(
+                count_and_sum_query_validation_error_to_static_str(e),
+            )),
+        }
     }
 
     /// Size-constraint check used for **leaf**
@@ -495,6 +503,10 @@ impl SizedQuery {
 /// `grovedb_query::error::Error::InvalidOperation(&'static str)`, so this is
 /// just a projection of that variant; any other error variant (which would
 /// indicate an unrelated bug) is forwarded as a generic catch-all label.
+///
+/// The `SizedQuery` validators apply this and the two mirrors below in a
+/// `match` on the result, not through `map_err`: the extracted model has no
+/// function values.
 pub(crate) fn query_validation_error_to_static_str(e: grovedb_query::error::Error) -> &'static str {
     match e {
         grovedb_query::error::Error::InvalidOperation(msg) => msg,
