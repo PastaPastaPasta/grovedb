@@ -65,10 +65,7 @@ impl SumBudgetRead {
             ));
         }
         if self.sum_limit > i64::MAX as u64 {
-            return Err(Error::InvalidOperation(
-                "sum-budget read: `sum_limit` must fit in i64 — the budget arithmetic is \
-                 signed",
-            ));
+            return Err(non_ascii_messages::sum_limit_exceeds_i64());
         }
         if self.match_limit == Some(0) {
             return Err(Error::InvalidOperation(
@@ -253,12 +250,46 @@ fn branches_have_read_mode(
     }
 }
 
+/// Error values whose messages contain non-ASCII text (an em dash), built
+/// out of line: the extracted Lean model cannot carry such string literals,
+/// so the closure configuration marks this module opaque. The messages are
+/// verbatim; callers return these exactly where they built them before.
+mod non_ascii_messages {
+    use crate::error::Error;
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn sum_limit_exceeds_i64() -> Error {
+        Error::InvalidOperation(
+            "sum-budget read: `sum_limit` must fit in i64 — the budget arithmetic is \
+             signed",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bincode::config;
 
     use super::*;
     use crate::axis_query::IndexAxis;
+
+    /// Pins the message moved into `non_ascii_messages`, as it read inline.
+    #[test]
+    fn sum_limit_overflow_message_is_unchanged() {
+        let budget = SumBudgetRead {
+            sum_limit: i64::MAX as u64 + 1,
+            match_limit: None,
+        };
+        match budget.validate() {
+            Err(Error::InvalidOperation(msg)) => assert_eq!(
+                msg,
+                "sum-budget read: `sum_limit` must fit in i64 — the budget arithmetic is \
+                 signed"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn read_mode_round_trips() {

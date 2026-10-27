@@ -600,10 +600,7 @@ impl AxisQuery {
                 // in every use case seen so far — permit it later if
                 // one appears (additive).
                 if self.axis == IndexAxis::Avg {
-                    return Err(Error::InvalidOperation(
-                        "axis query: the Avg axis has no value-range aggregate — an \
-                         aggregate of averages is not meaningful",
-                    ));
+                    return Err(non_ascii_messages::avg_axis_value_range());
                 }
                 self.validate_bounds(*lo, *hi)?;
             }
@@ -717,11 +714,51 @@ impl fmt::Display for AxisQuery {
     }
 }
 
+/// Error values whose messages contain non-ASCII text (an em dash), built
+/// out of line: the extracted Lean model cannot carry such string literals,
+/// so the closure configuration marks this module opaque. The messages are
+/// verbatim; callers return these exactly where they built them before.
+mod non_ascii_messages {
+    use crate::error::Error;
+
+    /// `Error::InvalidOperation` with the message below.
+    #[cold]
+    pub(super) fn avg_axis_value_range() -> Error {
+        Error::InvalidOperation(
+            "axis query: the Avg axis has no value-range aggregate — an \
+             aggregate of averages is not meaningful",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bincode::config;
 
     use super::*;
+
+    /// Pins the message moved into `non_ascii_messages`, as it read inline.
+    #[test]
+    fn avg_axis_value_range_message_is_unchanged() {
+        let query = AxisQuery {
+            axis: IndexAxis::Avg,
+            traversal: AxisTraversal::AggregateOverValueRange {
+                lo: 0,
+                hi: 1,
+                fold: AggregateFold::Total,
+            },
+            descending: false,
+            projection: AxisProjection::Entries,
+        };
+        match query.validate() {
+            Err(Error::InvalidOperation(msg)) => assert_eq!(
+                msg,
+                "axis query: the Avg axis has no value-range aggregate — an \
+                 aggregate of averages is not meaningful"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
 
     #[test]
     fn axis_tag_round_trip() {
