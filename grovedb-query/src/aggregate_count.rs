@@ -21,7 +21,12 @@
 
 use indexmap::IndexMap;
 
-use crate::{error::Error, query::Query, query_item::QueryItem, SubqueryBranch};
+use crate::{
+    error::Error,
+    query::{any_empty_key, is_carrier_outer_item, Query},
+    query_item::QueryItem,
+    SubqueryBranch,
+};
 
 impl Query {
     /// Creates an aggregate-count-on-range query that counts the elements
@@ -231,42 +236,8 @@ impl Query {
                 "carrier AggregateCountOnRange query must have at least one outer item",
             ));
         }
-        for item in &self.items {
-            match item {
-                QueryItem::Key(_)
-                | QueryItem::Range(_)
-                | QueryItem::RangeInclusive(_)
-                | QueryItem::RangeFrom(_)
-                | QueryItem::RangeTo(_)
-                | QueryItem::RangeToInclusive(_)
-                | QueryItem::RangeAfter(_)
-                | QueryItem::RangeAfterTo(_)
-                | QueryItem::RangeAfterToInclusive(_) => {}
-                QueryItem::RangeFull(_) => {
-                    return Err(Error::InvalidOperation(
-                        "carrier AggregateCountOnRange query may not have a RangeFull outer item",
-                    ));
-                }
-                QueryItem::AggregateCountOnRange(_) => {
-                    return Err(Error::InvalidOperation(
-                        "carrier AggregateCountOnRange query may not own an \
-                         AggregateCountOnRange item — use the leaf shape instead",
-                    ));
-                }
-                QueryItem::AggregateSumOnRange(_) => {
-                    return Err(Error::InvalidOperation(
-                        "carrier AggregateCountOnRange query may not own an \
-                         AggregateSumOnRange item — the two aggregate variants are orthogonal",
-                    ));
-                }
-                QueryItem::AggregateCountAndSumOnRange(_) => {
-                    return Err(Error::InvalidOperation(
-                        "carrier AggregateCountOnRange query may not own an \
-                         AggregateCountAndSumOnRange item — the aggregate variants are \
-                         orthogonal",
-                    ));
-                }
-            }
+        if let Some(error) = first_carrier_count_outer_item_error(&self.items) {
+            return Err(error);
         }
         let subquery = match self.default_subquery_branch.subquery.as_deref() {
             Some(sub) => sub,
@@ -278,7 +249,7 @@ impl Query {
             }
         };
         if let Some(path) = &self.default_subquery_branch.subquery_path
-            && path.iter().any(|k| k.is_empty())
+            && any_empty_key(path)
         {
             return Err(Error::InvalidOperation(
                 "carrier AggregateCountOnRange query's subquery_path must contain non-empty keys",
@@ -323,6 +294,55 @@ fn branches_have_aggregate_count_on_range(
         let mid = lo + (hi - lo) / 2;
         branches_have_aggregate_count_on_range(branches, lo, mid)
             || branches_have_aggregate_count_on_range(branches, mid, hi)
+    }
+}
+
+/// The error for an outer item a carrier `AggregateCountOnRange` query may not
+/// own, or `None` for the `Key(_)` / `Range*(_)` items it may.
+fn carrier_count_outer_item_error(item: &QueryItem) -> Option<Error> {
+    match item {
+        QueryItem::Key(_)
+        | QueryItem::Range(_)
+        | QueryItem::RangeInclusive(_)
+        | QueryItem::RangeFrom(_)
+        | QueryItem::RangeTo(_)
+        | QueryItem::RangeToInclusive(_)
+        | QueryItem::RangeAfter(_)
+        | QueryItem::RangeAfterTo(_)
+        | QueryItem::RangeAfterToInclusive(_) => None,
+        QueryItem::RangeFull(_) => Some(Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not have a RangeFull outer item",
+        )),
+        QueryItem::AggregateCountOnRange(_) => Some(Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not own an \
+                 AggregateCountOnRange item — use the leaf shape instead",
+        )),
+        QueryItem::AggregateSumOnRange(_) => Some(Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not own an \
+                 AggregateSumOnRange item — the two aggregate variants are orthogonal",
+        )),
+        QueryItem::AggregateCountAndSumOnRange(_) => Some(Error::InvalidOperation(
+            "carrier AggregateCountOnRange query may not own an \
+                 AggregateCountAndSumOnRange item — the aggregate variants are \
+                 orthogonal",
+        )),
+    }
+}
+
+/// The error for the first outer item, in order, that a carrier
+/// `AggregateCountOnRange` query may not own, or `None` if it may own them all. An
+/// index loop without an early return; the loop condition tests a `bool`, not
+/// the `Option<Error>` (whose `&'static str` the extracted model would see as
+/// a nested borrow).
+fn first_carrier_count_outer_item_error(items: &[QueryItem]) -> Option<Error> {
+    let mut i = 0;
+    while i < items.len() && is_carrier_outer_item(&items[i]) {
+        i += 1;
+    }
+    if i < items.len() {
+        carrier_count_outer_item_error(&items[i])
+    } else {
+        None
     }
 }
 

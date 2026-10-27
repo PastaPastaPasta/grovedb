@@ -65,6 +65,9 @@ mod query;
 mod subquery_branch;
 mod terminal_keys;
 
+#[cfg(test)]
+mod aggregate_reference_tests;
+
 pub use aggregate_sum_query::AggregateSumQuery;
 pub use axis_query::{
     AggregateFold, AxisProjection, AxisQuery, AxisTraversal, IndexAxis, UnknownAxisTag,

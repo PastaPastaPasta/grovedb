@@ -414,6 +414,36 @@ impl Query {
     }
 }
 
+/// Whether a carrier aggregate query may own `item` as an outer item: a
+/// `Key(_)` or a bounded `Range*(_)` item (not `RangeFull`, not an aggregate).
+pub(crate) fn is_carrier_outer_item(item: &QueryItem) -> bool {
+    match item {
+        QueryItem::Key(_)
+        | QueryItem::Range(_)
+        | QueryItem::RangeInclusive(_)
+        | QueryItem::RangeFrom(_)
+        | QueryItem::RangeTo(_)
+        | QueryItem::RangeToInclusive(_)
+        | QueryItem::RangeAfter(_)
+        | QueryItem::RangeAfterTo(_)
+        | QueryItem::RangeAfterToInclusive(_) => true,
+        QueryItem::RangeFull(_)
+        | QueryItem::AggregateCountOnRange(_)
+        | QueryItem::AggregateSumOnRange(_)
+        | QueryItem::AggregateCountAndSumOnRange(_) => false,
+    }
+}
+
+/// Whether any key in `keys` is empty (`keys.iter().any(|k| k.is_empty())`),
+/// as an index loop without a closure or an early return.
+pub(crate) fn any_empty_key(keys: &[Vec<u8>]) -> bool {
+    let mut i = 0;
+    while i < keys.len() && !keys[i].is_empty() {
+        i += 1;
+    }
+    i < keys.len()
+}
+
 /// Whether any conditional branch in `lo..hi`, in map order, has a subquery
 /// for which `Query::has_instance_limit_anywhere` holds (`lo = 0`, `hi = branches.len()`
 /// for the whole map). The range is halved, left half first; the depth is
