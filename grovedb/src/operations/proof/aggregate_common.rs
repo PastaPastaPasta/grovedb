@@ -40,7 +40,7 @@
 
 use grovedb_merk::{
     proofs::{
-        query::{ProofLimitMode, QueryProofVerify, PROOF_VERSION_LATEST},
+        query::{ProofLimitMode, ProvedKeyOptionalValue, QueryProofVerify, PROOF_VERSION_LATEST},
         Query as MerkQuery,
     },
     CryptoHash,
@@ -225,31 +225,43 @@ pub(in crate::operations::proof) fn verify_single_key_layer_proof_v0(
             )
         })?;
 
-    let proved = merk_result
-        .result_set
-        .iter()
-        .find(|p| p.key == target_key)
-        .ok_or_else(|| {
-            Error::InvalidProof(
-                path_query.clone(),
-                format!(
-                    "non-leaf proof did not contain the expected key {}",
-                    hex::encode(target_key)
-                ),
-            )
-        })?;
-
-    let value_bytes = proved.value.clone().ok_or_else(|| {
-        Error::InvalidProof(
+    let proved_index = first_row_with_key(&merk_result.result_set, target_key);
+    if proved_index == merk_result.result_set.len() {
+        return Err(Error::InvalidProof(
             path_query.clone(),
             format!(
-                "non-leaf proof for key {} returned no value bytes",
+                "non-leaf proof did not contain the expected key {}",
                 hex::encode(target_key)
             ),
-        )
-    })?;
+        ));
+    }
+    let proved = &merk_result.result_set[proved_index];
+
+    let value_bytes = match &proved.value {
+        Some(value) => value.clone(),
+        None => {
+            return Err(Error::InvalidProof(
+                path_query.clone(),
+                format!(
+                    "non-leaf proof for key {} returned no value bytes",
+                    hex::encode(target_key)
+                ),
+            ));
+        }
+    };
 
     Ok((value_bytes, root_hash, proved.proof))
+}
+
+/// Index of the first row whose key is `key`, or `rows.len()` if there is
+/// none: `rows.iter().position(|p| p.key == key)` as an index loop without a
+/// closure or an early return.
+fn first_row_with_key(rows: &[ProvedKeyOptionalValue], key: &[u8]) -> usize {
+    let mut i = 0;
+    while i < rows.len() && rows[i].key.as_slice() != key {
+        i += 1;
+    }
+    i
 }
 
 /// One matched outer key in the carrier layer's multi-key merk proof.
@@ -466,6 +478,8 @@ pub(in crate::operations::proof) fn require_v1_envelope<'a>(
 
 #[cfg(test)]
 mod reference_tests {
+    use grovedb_merk::proofs::query::ProvedKeyOptionalValue;
+
     use super::*;
 
     // ---- previous body, verbatim except for the `ref_` name ----
@@ -551,6 +565,33 @@ mod reference_tests {
                 .map(|(i, k)| (k.clone(), i as u64, -(i as i64)))
                 .collect();
             check_page(count_and_sum, |entry| &entry.0);
+        }
+    }
+
+    #[test]
+    fn first_row_with_key_matches_position() {
+        for keys in key_lists() {
+            let rows: Vec<ProvedKeyOptionalValue> = keys
+                .iter()
+                .map(|key| ProvedKeyOptionalValue {
+                    key: key.clone(),
+                    value: None,
+                    proof: [0; 32],
+                    child_hash_verified: false,
+                })
+                .collect();
+            let targets: [&[u8]; 5] = [b"", b"a", b"b", b"ab", b"zz"];
+            for target in targets {
+                let want = rows
+                    .iter()
+                    .position(|p| p.key == target)
+                    .unwrap_or(rows.len());
+                assert_eq!(
+                    first_row_with_key(&rows, target),
+                    want,
+                    "{keys:?} {target:?}"
+                );
+            }
         }
     }
 }
