@@ -172,12 +172,17 @@ fn query_to_ranges(query: &Query, total_count: u64) -> Result<Vec<(u64, u64)>, B
 /// verifier both derive it from `(start, limit)`, so a client only needs its
 /// cursor and page size. `start + limit` saturates at `u64::MAX`, and
 /// verification clamps the range to the tree's provable total count.
+// `push` rather than `vec![..]`, whose boxed-slice expansion the Rust-to-Lean
+// extraction does not translate here.
+#[allow(clippy::vec_init_then_push)]
 pub fn position_range_query(start: u64, limit: u16) -> Query {
     let end = start.saturating_add(limit as u64);
+    let mut items = Vec::with_capacity(1);
+    items.push(QueryItem::Range(
+        start.to_be_bytes().to_vec()..end.to_be_bytes().to_vec(),
+    ));
     Query {
-        items: vec![QueryItem::Range(
-            start.to_be_bytes().to_vec()..end.to_be_bytes().to_vec(),
-        )],
+        items,
         left_to_right: true,
         ..Query::default()
     }

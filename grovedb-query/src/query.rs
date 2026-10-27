@@ -529,9 +529,14 @@ impl Query {
     }
 
     /// Creates a new query which contains only one key.
+    // `push` rather than `vec![..]`, whose boxed-slice expansion the
+    // extraction does not translate here.
+    #[allow(clippy::vec_init_then_push)]
     pub fn new_single_key(key: Vec<u8>) -> Self {
+        let mut items = Vec::with_capacity(1);
+        items.push(QueryItem::Key(key));
         Self {
-            items: vec![QueryItem::Key(key)],
+            items,
             left_to_right: true,
             ..Self::default()
         }

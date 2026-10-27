@@ -564,7 +564,7 @@ impl PathQuery {
                     items: vec![QueryItem::Key(key)],
                     default_subquery_branch: SubqueryBranch {
                         subquery_path: None,
-                        subquery: Some(position_query.into()),
+                        subquery: Some(Box::new(position_query)),
                     },
                     left_to_right: true,
                     conditional_subquery_branches: None,
