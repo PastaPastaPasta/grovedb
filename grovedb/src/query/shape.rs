@@ -485,17 +485,29 @@ fn has_repeated_key_item(items: &[QueryItem]) -> bool {
     let mut repeated = false;
     let mut i = 0;
     while i < items.len() && !repeated {
-        if let QueryItem::Key(key) = &items[i] {
-            // `match` rather than `!`: the extraction renders `!` on this
-            // `bool` as a proposition.
-            repeated = match seen.insert(key.clone()) {
-                true => false,
-                false => true,
-            };
-        }
+        repeated = key_seen_before(&mut seen, &items[i]);
         i += 1;
     }
     repeated
+}
+
+/// One step of `has_repeated_key_item`: records a `Key` item's key in `seen`
+/// and reports whether it was already there; any other item reports `false`
+/// (the loop only runs while nothing has repeated, so this leaves the flag as
+/// it was). A function of its own, and `if` rather than `!`, so the
+/// extraction can translate it.
+#[allow(clippy::needless_bool)]
+fn key_seen_before(seen: &mut std::collections::BTreeSet<Vec<u8>>, item: &QueryItem) -> bool {
+    match item {
+        QueryItem::Key(key) => {
+            if seen.insert(key.clone()) {
+                false
+            } else {
+                true
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Whether any path segment is empty
