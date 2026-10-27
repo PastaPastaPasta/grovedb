@@ -104,14 +104,42 @@ pub(in crate::operations::proof) fn refuse_zero_ceiling(
     Ok(())
 }
 
+/// An entry of a carrier aggregate page, which starts with the outer key it
+/// was verified under. [`up_to_limit_page`] takes this trait rather than a
+/// function reading the key, because the extracted model has no function
+/// values.
+pub(in crate::operations::proof) trait OuterKeyed {
+    /// The entry's outer key.
+    fn outer_key(&self) -> &[u8];
+}
+
+/// A per-key count entry: `(outer_key, count)`.
+impl OuterKeyed for (Vec<u8>, u64) {
+    fn outer_key(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+/// A per-key sum entry: `(outer_key, sum)`.
+impl OuterKeyed for (Vec<u8>, i64) {
+    fn outer_key(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+/// A per-key count-and-sum entry: `(outer_key, count, sum)`.
+impl OuterKeyed for (Vec<u8>, u64, i64) {
+    fn outer_key(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
 /// Build the page an `*_up_to_limit` verifier returns from its walk's
 /// entries and whether the proof showed the outer query exhausted.
-/// `outer_key` reads an entry's outer key.
-pub(in crate::operations::proof) fn up_to_limit_page<E>(
+pub(in crate::operations::proof) fn up_to_limit_page<E: OuterKeyed>(
     root_hash: CryptoHash,
     entries: Vec<E>,
     exhausted: bool,
-    outer_key: fn(&E) -> &[u8],
     path_query: &PathQuery,
 ) -> Result<(CryptoHash, CarrierAggregatePage<E>), Error> {
     if exhausted {
@@ -119,12 +147,13 @@ pub(in crate::operations::proof) fn up_to_limit_page<E>(
     }
     // Upper-bound verification never stops before the first result, and
     // a ceiling of 0 was refused up front.
-    let Some(last_key) = entries.last().map(|entry| outer_key(entry).to_vec()) else {
+    if entries.is_empty() {
         return Err(Error::InvalidProof(
             path_query.clone(),
             "upper-bound aggregate proof stopped before its first outer key".to_string(),
         ));
-    };
+    }
+    let last_key = entries[entries.len() - 1].outer_key().to_vec();
     Ok((
         root_hash,
         CarrierAggregatePage::MoreAfter { entries, last_key },
@@ -432,5 +461,96 @@ pub(in crate::operations::proof) fn require_v1_envelope<'a>(
                 query_type_name
             ),
         )),
+    }
+}
+
+#[cfg(test)]
+mod reference_tests {
+    use super::*;
+
+    // ---- previous body, verbatim except for the `ref_` name ----
+
+    fn ref_up_to_limit_page<E>(
+        root_hash: CryptoHash,
+        entries: Vec<E>,
+        exhausted: bool,
+        outer_key: fn(&E) -> &[u8],
+        path_query: &PathQuery,
+    ) -> Result<(CryptoHash, CarrierAggregatePage<E>), Error> {
+        if exhausted {
+            return Ok((root_hash, CarrierAggregatePage::Complete(entries)));
+        }
+        // Upper-bound verification never stops before the first result, and
+        // a ceiling of 0 was refused up front.
+        let Some(last_key) = entries.last().map(|entry| outer_key(entry).to_vec()) else {
+            return Err(Error::InvalidProof(
+                path_query.clone(),
+                "upper-bound aggregate proof stopped before its first outer key".to_string(),
+            ));
+        };
+        Ok((
+            root_hash,
+            CarrierAggregatePage::MoreAfter { entries, last_key },
+        ))
+    }
+
+    fn key_lists() -> Vec<Vec<Vec<u8>>> {
+        let keys: [&[u8]; 4] = [b"", b"a", b"b", b"ab"];
+        let mut lists: Vec<Vec<Vec<u8>>> = vec![vec![]];
+        let mut last: Vec<Vec<Vec<u8>>> = vec![vec![]];
+        for _ in 0..3 {
+            let mut longer = Vec::new();
+            for list in &last {
+                for key in keys {
+                    let mut l = list.clone();
+                    l.push(key.to_vec());
+                    longer.push(l);
+                }
+            }
+            lists.extend(longer.iter().cloned());
+            last = longer;
+        }
+        lists
+    }
+
+    fn check_page<E: OuterKeyed + Clone + PartialEq + std::fmt::Debug>(
+        entries: Vec<E>,
+        outer_key: fn(&E) -> &[u8],
+    ) {
+        let path_query = PathQuery::new_single_key(vec![b"p".to_vec()], b"k".to_vec());
+        for exhausted in [false, true] {
+            let got = up_to_limit_page([7; 32], entries.clone(), exhausted, &path_query);
+            let want =
+                ref_up_to_limit_page([7; 32], entries.clone(), exhausted, outer_key, &path_query);
+            match (got, want) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b),
+                (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                (a, b) => panic!("{a:?} != {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn up_to_limit_page_matches_reference() {
+        for keys in key_lists() {
+            let count: Vec<(Vec<u8>, u64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i as u64))
+                .collect();
+            check_page(count, |entry| &entry.0);
+            let sum: Vec<(Vec<u8>, i64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), -(i as i64)))
+                .collect();
+            check_page(sum, |entry| &entry.0);
+            let count_and_sum: Vec<(Vec<u8>, u64, i64)> = keys
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (k.clone(), i as u64, -(i as i64)))
+                .collect();
+            check_page(count_and_sum, |entry| &entry.0);
+        }
     }
 }

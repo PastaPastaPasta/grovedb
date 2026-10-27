@@ -230,7 +230,7 @@ impl GroveDb {
         refuse_zero_ceiling(path_query)?;
         let (root_hash, entries, exhausted) =
             verify_per_key(proof, path_query, ProofLimitMode::UpperBound, grove_version)?;
-        up_to_limit_page(root_hash, entries, exhausted, |entry| &entry.0, path_query)
+        up_to_limit_page(root_hash, entries, exhausted, path_query)
     }
 }
 
