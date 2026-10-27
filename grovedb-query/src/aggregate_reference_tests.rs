@@ -1,12 +1,19 @@
 //! Differential tests for the aggregate validators reshaped for the
 //! Rust-to-Lean extraction: each `ref_` function below is the previous body,
-//! verbatim except for its name, `q` for `self`, and calling the `ref_` leaf
-//! validator. Every generated query must get the same answer (the same
+//! verbatim except for its name and visibility, `q` for `self`, and calling
+//! the `ref_` leaf validator. Every generated query must get the same answer (the same
 //! borrowed item, or an error with the same variant and message) from both.
 
 use indexmap::IndexMap;
 
-use crate::{error::Error, query::any_empty_key, Query, QueryItem, SubqueryBranch};
+use crate::{
+    aggregate_count::carrier_count_outer_item_error,
+    aggregate_count_and_sum::carrier_count_and_sum_outer_item_error,
+    aggregate_sum::carrier_sum_outer_item_error,
+    error::Error,
+    query::{any_empty_key, is_carrier_outer_item},
+    Query, QueryItem, SubqueryBranch,
+};
 
 // ---- previous bodies ----
 
@@ -596,22 +603,53 @@ fn aggregate_validators_match_reference() {
 fn any_empty_key_matches_iterator_any() {
     let keys: [&[u8]; 3] = [b"", b"a", b"bc"];
     let mut lists: Vec<Vec<Vec<u8>>> = vec![vec![]];
+    let mut last: Vec<Vec<Vec<u8>>> = vec![vec![]];
     for _ in 0..3 {
         let mut longer = Vec::new();
-        for list in &lists {
+        for list in &last {
             for key in keys {
                 let mut l = list.clone();
                 l.push(key.to_vec());
                 longer.push(l);
             }
         }
-        lists.extend(longer);
+        lists.extend(longer.iter().cloned());
+        last = longer;
     }
     for list in &lists {
         assert_eq!(
             any_empty_key(list),
             list.iter().any(|k| k.is_empty()),
             "{list:?}"
+        );
+    }
+}
+
+/// The allowed outer-item set is spelled twice: `is_carrier_outer_item` (the
+/// scan) and the `None` arms of each axis's error function. They must agree,
+/// or a disallowed item would end the scan without an error.
+#[test]
+fn carrier_outer_item_errors_match_allowed_set() {
+    let mut items = plain_items();
+    items.extend(aggregate_items(&QueryItem::Range(
+        b"a".to_vec()..b"m".to_vec(),
+    )));
+    for item in &items {
+        let allowed = is_carrier_outer_item(item);
+        assert_eq!(
+            carrier_count_outer_item_error(item).is_none(),
+            allowed,
+            "{item:?}"
+        );
+        assert_eq!(
+            carrier_sum_outer_item_error(item).is_none(),
+            allowed,
+            "{item:?}"
+        );
+        assert_eq!(
+            carrier_count_and_sum_outer_item_error(item).is_none(),
+            allowed,
+            "{item:?}"
         );
     }
 }

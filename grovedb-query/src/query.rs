@@ -434,6 +434,19 @@ pub(crate) fn is_carrier_outer_item(item: &QueryItem) -> bool {
     }
 }
 
+/// Index of the first item a carrier aggregate query may not own as an outer
+/// item (see [`is_carrier_outer_item`]), or `items.len()` if it may own them
+/// all. An index loop without a closure or an early return; its condition
+/// tests a `bool`, not an `Option<Error>` (whose `&'static str` the extracted
+/// model would see as a nested borrow).
+pub(crate) fn first_non_carrier_outer_item(items: &[QueryItem]) -> usize {
+    let mut i = 0;
+    while i < items.len() && is_carrier_outer_item(&items[i]) {
+        i += 1;
+    }
+    i
+}
+
 /// Whether any key in `keys` is empty (`keys.iter().any(|k| k.is_empty())`),
 /// as an index loop without a closure or an early return.
 pub(crate) fn any_empty_key(keys: &[Vec<u8>]) -> bool {

@@ -28,7 +28,7 @@ use indexmap::IndexMap;
 
 use crate::{
     error::Error,
-    query::{any_empty_key, is_carrier_outer_item, Query},
+    query::{any_empty_key, first_non_carrier_outer_item, Query},
     query_item::QueryItem,
     SubqueryBranch,
 };
@@ -255,8 +255,10 @@ impl Query {
 }
 
 /// The error for an outer item a carrier `AggregateCountAndSumOnRange` query may not
-/// own, or `None` for the `Key(_)` / `Range*(_)` items it may.
-fn carrier_count_and_sum_outer_item_error(item: &QueryItem) -> Option<Error> {
+/// own, or `None` for the `Key(_)` / `Range*(_)` items it may: `None`
+/// exactly when `is_carrier_outer_item` holds (pinned by
+/// `aggregate_reference_tests::carrier_outer_item_errors_match_allowed_set`).
+pub(crate) fn carrier_count_and_sum_outer_item_error(item: &QueryItem) -> Option<Error> {
     match item {
         QueryItem::Key(_)
         | QueryItem::Range(_)
@@ -269,7 +271,7 @@ fn carrier_count_and_sum_outer_item_error(item: &QueryItem) -> Option<Error> {
         | QueryItem::RangeAfterToInclusive(_) => None,
         QueryItem::RangeFull(_) => Some(Error::InvalidOperation(
             "carrier AggregateCountAndSumOnRange query may not have a RangeFull \
-                 outer item",
+             outer item",
         )),
         QueryItem::AggregateCountAndSumOnRange(_) => {
             Some(non_ascii_messages::carrier_owns_aggregate_count_and_sum())
@@ -282,15 +284,9 @@ fn carrier_count_and_sum_outer_item_error(item: &QueryItem) -> Option<Error> {
 }
 
 /// The error for the first outer item, in order, that a carrier
-/// `AggregateCountAndSumOnRange` query may not own, or `None` if it may own them all. An
-/// index loop without an early return; the loop condition tests a `bool`, not
-/// the `Option<Error>` (whose `&'static str` the extracted model would see as
-/// a nested borrow).
+/// `AggregateCountAndSumOnRange` query may not own, or `None` if it may own them all.
 fn first_carrier_count_and_sum_outer_item_error(items: &[QueryItem]) -> Option<Error> {
-    let mut i = 0;
-    while i < items.len() && is_carrier_outer_item(&items[i]) {
-        i += 1;
-    }
+    let i = first_non_carrier_outer_item(items);
     if i < items.len() {
         carrier_count_and_sum_outer_item_error(&items[i])
     } else {
