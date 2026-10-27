@@ -151,7 +151,7 @@ impl Query {
             ));
         }
         let inner = match &self.items[0] {
-            QueryItem::AggregateCountOnRange(inner) => inner.as_ref(),
+            QueryItem::AggregateCountOnRange(inner) => &**inner,
             _ => {
                 return Err(Error::InvalidOperation(
                     "validate_aggregate_count_on_range called on a query without an \

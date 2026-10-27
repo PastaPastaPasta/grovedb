@@ -348,7 +348,12 @@ pub(in crate::operations::proof) fn execute_carrier_layer_proof(
         })?;
 
     let mut matched = Vec::with_capacity(merk_result.result_set.len());
-    for proved in &merk_result.result_set {
+    // An index loop rather than `for` over `&Vec`, whose `IntoIterator`
+    // has no model in the extraction.
+    let rows = &merk_result.result_set;
+    let mut i = 0;
+    while i < rows.len() {
+        let proved = &rows[i];
         let value = proved.value.clone().ok_or_else(|| {
             Error::InvalidProof(
                 path_query.clone(),
@@ -364,6 +369,7 @@ pub(in crate::operations::proof) fn execute_carrier_layer_proof(
             value_bytes: value,
             commitment_hash: proved.proof,
         });
+        i += 1;
     }
 
     Ok((root_hash, matched, merk_result.exhausted))
@@ -435,11 +441,10 @@ where
     // just need to extract the outer items and the optional
     // subquery_path.
     let outer_items = q.items.clone();
-    let subquery_path = q
-        .default_subquery_branch
-        .subquery_path
-        .clone()
-        .unwrap_or_default();
+    let subquery_path = match &q.default_subquery_branch.subquery_path {
+        Some(path) => path.clone(),
+        None => Vec::new(),
+    };
     Ok(AggregateClassification {
         leaf_inner_range: leaf_inner,
         carrier_outer_items: Some(outer_items),
