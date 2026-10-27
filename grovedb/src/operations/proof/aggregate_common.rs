@@ -483,8 +483,6 @@ pub(in crate::operations::proof) fn require_v1_envelope<'a>(
 
 #[cfg(test)]
 mod reference_tests {
-    use grovedb_merk::proofs::query::ProvedKeyOptionalValue;
-
     use super::*;
 
     // ---- previous body, verbatim except for the `ref_` name ----

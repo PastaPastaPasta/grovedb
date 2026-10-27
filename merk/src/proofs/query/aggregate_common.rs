@@ -121,10 +121,10 @@ pub(super) fn classify_subtree(
 /// boundary key outside the window its ancestors implied, and the
 /// classification logic would silently miscount/misadd children that
 /// don't actually exist at that position in the tree.
-#[cfg(any(feature = "minimal", feature = "verify"))]
 ///
 /// `match` rather than `Option::is_none_or`, to keep closures off the
 /// verifier path.
+#[cfg(any(feature = "minimal", feature = "verify"))]
 pub(super) fn key_strictly_inside(key: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
     let lo_ok = match lo {
         None => true,
