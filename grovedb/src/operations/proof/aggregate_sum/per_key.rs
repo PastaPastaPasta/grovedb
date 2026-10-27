@@ -166,60 +166,95 @@ fn verify_v1_carrier_layer(
     // `carrier_outer_items` is `Some`, `carrier_subquery_path` is also
     // `Some` (possibly empty). Surface a verification failure rather
     // than aborting if the invariant ever drifts.
-    let subquery_path = classification
-        .carrier_subquery_path
-        .as_ref()
-        .ok_or_else(|| {
-            Error::InvalidProof(
+    let subquery_path = match &classification.carrier_subquery_path {
+        Some(subquery_path) => subquery_path,
+        None => {
+            return Err(Error::InvalidProof(
                 path_query.clone(),
                 "carrier aggregate-sum classification missing subquery_path".to_string(),
-            )
-        })?;
+            ));
+        }
+    };
 
+    // An index loop without an early return: the first failing match ends
+    // the walk with its error, as `?` in a `for` loop over the matches did.
     let mut results = Vec::with_capacity(matched.len());
-    for OuterMatch {
-        outer_key,
-        value_bytes,
-        commitment_hash,
-    } in matched
-    {
-        let lower_layer = layer.lower_layers.get(&outer_key).ok_or_else(|| {
+    let mut failure = None;
+    let mut i = 0;
+    while i < matched.len() {
+        match verify_carrier_match(
+            layer,
+            path_query,
+            &matched[i],
+            subquery_path,
+            classification,
+            grove_version,
+        ) {
+            Ok(entry) => {
+                results.push(entry);
+                i += 1;
+            }
+            Err(e) => {
+                failure = Some(e);
+                i = matched.len();
+            }
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok((carrier_root, results, exhausted)),
+    }
+}
+
+/// One matched outer key of the carrier layer (the body of the outer-match
+/// loop in [`verify_v1_carrier_layer`]): descend `subquery_path` from its
+/// lower layer to the leaf proof, then check the chain from the match to
+/// that lower layer.
+fn verify_carrier_match(
+    layer: &LayerProof,
+    path_query: &PathQuery,
+    outer_match: &OuterMatch,
+    subquery_path: &[Vec<u8>],
+    classification: &AggregateSumClassification,
+    grove_version: &GroveVersion,
+) -> Result<(Vec<u8>, i64), Error> {
+    let lower_layer = layer
+        .lower_layers
+        .get(&outer_match.outer_key)
+        .ok_or_else(|| {
             Error::InvalidProof(
                 path_query.clone(),
                 format!(
                     "carrier aggregate-sum proof missing lower layer for outer key {}",
-                    hex::encode(&outer_key)
+                    hex::encode(&outer_match.outer_key)
                 ),
             )
         })?;
 
-        let (lower_root, sum) = verify_v1_subquery_path(
-            lower_layer,
-            path_query,
-            subquery_path,
-            0,
-            &classification.leaf_inner_range,
-            grove_version,
-        )?;
+    let (lower_root, sum) = verify_v1_subquery_path(
+        lower_layer,
+        path_query,
+        subquery_path,
+        0,
+        &classification.leaf_inner_range,
+        grove_version,
+    )?;
 
-        // Terminal here when the subquery_path is empty — the outer
-        // match goes directly to the leaf merk. When subquery_path has
-        // depth > 0, the leaf-terminal check fires inside
-        // `verify_v1_subquery_path` instead.
-        let is_terminal = subquery_path.is_empty();
-        enforce_lower_chain(
-            path_query,
-            &outer_key,
-            &value_bytes,
-            &lower_root,
-            &commitment_hash,
-            is_terminal,
-            grove_version,
-        )?;
-        results.push((outer_key, sum));
-    }
-
-    Ok((carrier_root, results, exhausted))
+    // Terminal here when the subquery_path is empty — the outer
+    // match goes directly to the leaf merk. When subquery_path has
+    // depth > 0, the leaf-terminal check fires inside
+    // `verify_v1_subquery_path` instead.
+    let is_terminal = subquery_path.is_empty();
+    enforce_lower_chain(
+        path_query,
+        &outer_match.outer_key,
+        &outer_match.value_bytes,
+        &lower_root,
+        &outer_match.commitment_hash,
+        is_terminal,
+        grove_version,
+    )?;
+    Ok((outer_match.outer_key.clone(), sum))
 }
 
 /// Walk the carrier's `subquery_path` (zero or more intermediate
