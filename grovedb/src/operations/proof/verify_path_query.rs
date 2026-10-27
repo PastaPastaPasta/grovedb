@@ -16,15 +16,13 @@
 //! Key-selection and aggregate shapes route to the existing verifiers
 //! unchanged.
 
+use std::collections::BTreeMap;
+
 use grovedb_merk::{
-    proofs::query::{AxisQuery, AxisTraversal},
+    proofs::query::{query_item::QueryItem, AxisQuery, AxisTraversal},
     CryptoHash,
 };
 use grovedb_version::version::GroveVersion;
-
-use std::collections::BTreeMap;
-
-use grovedb_merk::proofs::query::query_item::QueryItem;
 
 use crate::{
     operations::proof::{
@@ -952,39 +950,42 @@ mod reference_tests {
         s.to_vec()
     }
 
-    /// Outcome `i` of a fixed pool: well-formed paths `r/k/s` for three
-    /// branch keys and each result family, and paths off the structure.
-    fn outcome(i: usize) -> AxisWalkOutcome {
+    /// Outcome `i` of a fixed pool for a branched read over `prefix` and
+    /// `suffix`: well-formed paths `prefix/k/suffix` for three branch keys
+    /// and each result family, and paths off the structure (too short, a
+    /// wrong prefix segment, a wrong suffix segment).
+    fn outcome(i: usize, prefix: &[Vec<u8>], suffix: &[Vec<u8>]) -> AxisWalkOutcome {
         let entries = |axis| AxisWalkResult::Entries {
             entries: AxisEntries::empty_for_axis(axis),
             skipped: None,
         };
+        let at = |k: &[u8]| [prefix, &[seg(k)][..], suffix].concat();
         let (path, result) = match i {
-            0 => (
-                vec![seg(b"r"), seg(b"a"), seg(b"s")],
+            0 => (at(b"a"), entries(IndexAxis::Count)),
+            1 => (at(b"b"), entries(IndexAxis::Sum)),
+            2 => (at(b"c"), entries(IndexAxis::Avg)),
+            3 => (at(b"a"), AxisWalkResult::Rank { rank: 1 }),
+            4 => (
+                at(b"b")[..prefix.len() + 1].to_vec(),
                 entries(IndexAxis::Count),
             ),
-            1 => (
-                vec![seg(b"r"), seg(b"b"), seg(b"s")],
-                entries(IndexAxis::Sum),
-            ),
-            2 => (
-                vec![seg(b"r"), seg(b"c"), seg(b"s")],
-                entries(IndexAxis::Avg),
-            ),
-            3 => (
-                vec![seg(b"r"), seg(b"a"), seg(b"s")],
-                AxisWalkResult::Rank { rank: 1 },
-            ),
-            4 => (vec![seg(b"r"), seg(b"b")], entries(IndexAxis::Count)),
-            5 => (
-                vec![seg(b"x"), seg(b"a"), seg(b"s")],
-                entries(IndexAxis::Count),
-            ),
-            _ => (
-                vec![seg(b"r"), seg(b"a"), seg(b"t")],
-                entries(IndexAxis::Count),
-            ),
+            5 => {
+                // A wrong segment in the prefix, or (for an empty prefix)
+                // one segment too many in front.
+                let mut path = at(b"a");
+                if prefix.is_empty() {
+                    path.insert(0, seg(b"x"));
+                } else {
+                    path[0] = seg(b"x");
+                }
+                (path, entries(IndexAxis::Count))
+            }
+            _ => {
+                let mut path = at(b"a");
+                let last = path.len() - 1;
+                path[last] = seg(b"t");
+                (path, entries(IndexAxis::Count))
+            }
         };
         AxisWalkOutcome { path, result }
     }
@@ -1011,6 +1012,7 @@ mod reference_tests {
 
     fn branch_item_lists() -> Vec<Vec<QueryItem>> {
         let key = |k: &[u8]| QueryItem::Key(k.to_vec());
+        let range = || QueryItem::Range(b"a".to_vec()..b"b".to_vec());
         vec![
             vec![],
             vec![key(b"a")],
@@ -1018,62 +1020,87 @@ mod reference_tests {
             vec![key(b"b"), key(b"a"), key(b"c")],
             vec![key(b"a"), key(b"a")],
             vec![key(b"d")],
-            vec![QueryItem::Range(b"a".to_vec()..b"b".to_vec())],
+            vec![range()],
+            vec![key(b"d"), range()],
+            vec![range(), key(b"d")],
+            vec![key(b"a"), range(), key(b"b")],
         ]
     }
 
-    fn trio_lists() -> Vec<Vec<PathKeyOptionalElementTrio>> {
+    /// Trio lists over `prefix`: absent and present rows for a branch key
+    /// at the branching level, present rows under a branch, and rows off
+    /// the prefix.
+    fn trio_lists(prefix: &[Vec<u8>]) -> Vec<Vec<PathKeyOptionalElementTrio>> {
         let item = || Some(Element::new_item(b"v".to_vec()));
-        let r = || vec![seg(b"r")];
+        let p = || prefix.to_vec();
+        let under = |k: &[u8], rest: &[&[u8]]| {
+            let mut path = p();
+            path.push(seg(k));
+            for r in rest {
+                path.push(seg(r));
+            }
+            path
+        };
+        let mut off = p();
+        off.insert(0, seg(b"q"));
         vec![
             vec![],
-            vec![(r(), seg(b"a"), None)],
-            vec![(r(), seg(b"a"), item())],
-            vec![(r(), seg(b"d"), item())],
-            vec![(vec![seg(b"r"), seg(b"d"), seg(b"s")], seg(b"x"), item())],
-            vec![(vec![seg(b"r"), seg(b"d")], seg(b"x"), None)],
-            vec![
-                (vec![seg(b"q"), seg(b"d")], seg(b"x"), item()),
-                (r(), seg(b"b"), item()),
-            ],
+            vec![(p(), seg(b"a"), None)],
+            vec![(p(), seg(b"a"), item())],
+            vec![(p(), seg(b"d"), item())],
+            vec![(under(b"d", &[b"s"]), seg(b"x"), item())],
+            vec![(under(b"d", &[]), seg(b"x"), None)],
+            vec![(off, seg(b"d"), item()), (p(), seg(b"b"), item())],
             vec![(vec![], seg(b"r"), item())],
         ]
     }
 
     #[test]
     fn branched_read_matches_reference() {
-        let path_query = PathQuery::new_single_key(vec![seg(b"r")], b"k".to_vec());
-        let suffix = vec![seg(b"s")];
+        let shapes = [
+            (vec![seg(b"r")], vec![seg(b"s")]),
+            (vec![], vec![seg(b"s")]),
+            (vec![seg(b"r"), seg(b"q")], vec![seg(b"s"), seg(b"u")]),
+        ];
         let mut cases = 0;
-        for outcomes in outcome_lists() {
-            for items in branch_item_lists() {
-                for trios in trio_lists() {
-                    let got = GroveDb::branched_axis_into_verified(
-                        [1; 32],
-                        &trios,
-                        outcomes.iter().map(|&i| outcome(i)).collect(),
-                        &items,
-                        &suffix,
-                        &path_query,
-                    );
-                    let want = ref_branched(
-                        [1; 32],
-                        trios.clone(),
-                        outcomes.iter().map(|&i| outcome(i)).collect(),
-                        &items,
-                        &suffix,
-                        &path_query,
-                    );
-                    assert_eq!(
-                        format!("{got:?}"),
-                        format!("{want:?}"),
-                        "{outcomes:?} {items:?} {trios:?}"
-                    );
-                    cases += 1;
+        for (prefix, suffix) in &shapes {
+            let path_query = PathQuery::new_single_key(prefix.clone(), b"k".to_vec());
+            for outcomes in outcome_lists() {
+                for items in branch_item_lists() {
+                    for trios in trio_lists(prefix) {
+                        let got = GroveDb::branched_axis_into_verified(
+                            [1; 32],
+                            &trios,
+                            outcomes
+                                .iter()
+                                .map(|&i| outcome(i, prefix, suffix))
+                                .collect(),
+                            &items,
+                            suffix,
+                            &path_query,
+                        );
+                        let want = ref_branched(
+                            [1; 32],
+                            trios.clone(),
+                            outcomes
+                                .iter()
+                                .map(|&i| outcome(i, prefix, suffix))
+                                .collect(),
+                            &items,
+                            suffix,
+                            &path_query,
+                        );
+                        assert_eq!(
+                            format!("{got:?}"),
+                            format!("{want:?}"),
+                            "{outcomes:?} {items:?} {trios:?}"
+                        );
+                        cases += 1;
+                    }
                 }
             }
         }
-        assert!(cases > 20_000);
+        assert!(cases > 90_000, "{cases}");
     }
 
     #[test]
@@ -1137,8 +1164,9 @@ mod reference_tests {
     #[test]
     fn single_outcome_matches_array_try_from() {
         for n in 0..4 {
-            let got = single_outcome((0..n).map(outcome).collect());
-            let want = <[AxisWalkOutcome; 1]>::try_from((0..n).map(outcome).collect::<Vec<_>>());
+            let one = |i| outcome(i, &[], &[]);
+            let got = single_outcome((0..n).map(one).collect());
+            let want = <[AxisWalkOutcome; 1]>::try_from((0..n).map(one).collect::<Vec<_>>());
             match (got, want) {
                 (Ok(a), Ok([b])) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
                 (Err(len), Err(v)) => assert_eq!(len, v.len()),

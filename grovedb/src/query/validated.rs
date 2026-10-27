@@ -335,6 +335,7 @@ mod capability_reference_tests {
     };
 
     use super::*;
+    use crate::query::shape::AggregateKind;
 
     fn ref_message(
         shape: PathQueryShape<'_>,

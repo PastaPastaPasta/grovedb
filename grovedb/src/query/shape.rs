@@ -1009,8 +1009,9 @@ mod read_mode_shape_reference_tests {
             }
         }
         // The root-level gates, and the empty path, over a few bodies.
-        let base = out.clone();
-        for pq in base.iter().step_by(97) {
+        let total = out.len();
+        for i in (0..total).step_by(97) {
+            let pq = out[i].clone();
             let mut v = pq.clone();
             v.path.clear();
             out.push(v);
