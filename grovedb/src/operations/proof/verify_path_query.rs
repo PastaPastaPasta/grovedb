@@ -22,6 +22,10 @@ use grovedb_merk::{
 };
 use grovedb_version::version::GroveVersion;
 
+use std::collections::BTreeMap;
+
+use grovedb_merk::proofs::query::query_item::QueryItem;
+
 use crate::{
     operations::proof::{
         decode_grovedb_proof_canonical,
@@ -210,10 +214,7 @@ impl GroveDb {
                     )?;
                     Ok(VerifiedPathQuery::AggregatePerKey {
                         root_hash,
-                        per_key: per_key
-                            .into_iter()
-                            .map(|(key, count)| (key, Some(count), None))
-                            .collect(),
+                        per_key: count_per_key_entries(&per_key),
                     })
                 }
                 AggregateKind::Sum => {
@@ -221,10 +222,7 @@ impl GroveDb {
                         Self::verify_aggregate_sum_query_per_key(proof, path_query, grove_version)?;
                     Ok(VerifiedPathQuery::AggregatePerKey {
                         root_hash,
-                        per_key: per_key
-                            .into_iter()
-                            .map(|(key, sum)| (key, None, Some(sum)))
-                            .collect(),
+                        per_key: sum_per_key_entries(&per_key),
                     })
                 }
                 AggregateKind::CountAndSum => {
@@ -235,46 +233,43 @@ impl GroveDb {
                     )?;
                     Ok(VerifiedPathQuery::AggregatePerKey {
                         root_hash,
-                        per_key: per_key
-                            .into_iter()
-                            .map(|(key, count, sum)| (key, Some(count), Some(sum)))
-                            .collect(),
+                        per_key: count_and_sum_per_key_entries(&per_key),
                     })
                 }
             },
             PathQueryShape::AxisRead { axis } => {
                 let (root_hash, trios, outcomes) =
                     Self::verify_axis_shape_walk(proof, &validated, grove_version)?;
-                let outcome = match <[AxisWalkOutcome; 1]>::try_from(outcomes) {
-                    Ok([outcome]) => outcome,
+                let AxisWalkOutcome { path, result } = match single_outcome(outcomes) {
+                    Ok(outcome) => outcome,
                     // No axis layer at all: the walk authenticated that
                     // the queried path does not exist, and the answer
                     // is the traversal's empty one. See
                     // `absent_axis_path_into_verified` for why zero
                     // layers can mean nothing else.
-                    Err(outcomes) if outcomes.is_empty() => {
+                    Err(0) => {
                         return Self::absent_axis_path_into_verified(
                             root_hash, axis, &trios, path_query,
                         );
                     }
-                    Err(outcomes) => {
+                    Err(count) => {
                         return Err(Error::InvalidProof(
                             path_query.clone(),
                             format!(
                                 "a single-path axis read must verify exactly one axis layer, \
                                  got {}",
-                                outcomes.len()
+                                count
                             ),
                         ));
                     }
                 };
-                if outcome.path != path_query.path {
+                if path != path_query.path {
                     return Err(Error::InvalidProof(
                         path_query.clone(),
                         "the verified axis layer is not at the queried path".to_string(),
                     ));
                 }
-                Self::outcome_into_verified(root_hash, outcome.result, &axis.traversal, path_query)
+                Self::outcome_into_verified(root_hash, result, &axis.traversal, path_query)
             }
             PathQueryShape::BranchedAxisRead {
                 branch_items,
@@ -284,129 +279,39 @@ impl GroveDb {
                 let (root_hash, trios, outcomes) =
                     Self::verify_axis_shape_walk(proof, &validated, grove_version)?;
 
-                // Index outcomes by their branch key (the segment right
-                // after the branching prefix).
-                let prefix_len = path_query.path.len();
-                let mut by_branch_key: std::collections::BTreeMap<Vec<u8>, AxisWalkResult> =
-                    std::collections::BTreeMap::new();
-                for outcome in outcomes {
-                    let expected_len = prefix_len + 1 + suffix.len();
-                    if outcome.path.len() != expected_len
-                        || outcome.path[..prefix_len]
-                            .iter()
-                            .zip(&path_query.path)
-                            .any(|(a, b)| a != b)
-                        || outcome.path[prefix_len + 1..]
-                            .iter()
-                            .zip(suffix)
-                            .any(|(a, b)| a != b)
-                    {
-                        return Err(Error::InvalidProof(
-                            path_query.clone(),
-                            "a verified axis layer sits outside the branched query's \
-                             prefix/branch/suffix structure"
-                                .to_string(),
-                        ));
-                    }
-                    let branch_key = outcome.path[prefix_len].clone();
-                    if by_branch_key.insert(branch_key, outcome.result).is_some() {
-                        return Err(Error::InvalidProof(
-                            path_query.clone(),
-                            "duplicate axis layers for one branch key".to_string(),
-                        ));
-                    }
-                }
-
-                // Present-element trios anywhere under a branch key that
-                // produced no outcome would mean the prover proved the
-                // branch present but omitted its axis layer — hiding
-                // entries behind a fake absence. Reject.
-                let mut branches = Vec::with_capacity(branch_items.len());
-                for item in branch_items {
-                    let grovedb_merk::proofs::query::query_item::QueryItem::Key(branch_key) = item
-                    else {
-                        return Err(Error::CorruptedCodeExecution(
-                            "branched axis read classified with a non-Key branch item",
-                        ));
-                    };
-                    match by_branch_key.remove(branch_key) {
-                        Some(AxisWalkResult::Entries { entries, .. }) => {
-                            branches.push((branch_key.clone(), Some(entries)));
-                        }
-                        Some(_) => {
-                            return Err(Error::InvalidProof(
-                                path_query.clone(),
-                                "branched axis reads verify entry-listing traversals only"
-                                    .to_string(),
-                            ));
-                        }
-                        None => {
-                            // No axis layer for this branch: the
-                            // branching-level Merk proof must have
-                            // authenticated the key's ABSENCE. Any
-                            // present-element trio for the branch key
-                            // itself — or anywhere under its subtree —
-                            // means the proof shows the branch present
-                            // while withholding its axis layer, i.e. a
-                            // hidden branch dressed up as absence.
-                            let present = trios.iter().any(|(trio_path, trio_key, element)| {
-                                if element.is_none() {
-                                    return false;
-                                }
-                                // The branch key at the branching level…
-                                (trio_path == &path_query.path && trio_key == branch_key)
-                                    // …or anything below prefix/branch_key.
-                                    || (trio_path.len() > path_query.path.len()
-                                        && trio_path[..path_query.path.len()] == path_query.path
-                                        && trio_path[path_query.path.len()] == *branch_key)
-                            });
-                            if present {
-                                return Err(Error::InvalidProof(
-                                    path_query.clone(),
-                                    format!(
-                                        "branch key {} is proven present but its axis layer \
-                                         is missing from the proof",
-                                        hex::encode(branch_key),
-                                    ),
-                                ));
-                            }
-                            branches.push((branch_key.clone(), None));
-                        }
-                    }
-                }
-                if !by_branch_key.is_empty() {
-                    return Err(Error::InvalidProof(
-                        path_query.clone(),
-                        "the proof carries axis layers for branch keys the query does not name"
-                            .to_string(),
-                    ));
-                }
                 // A non-entry-listing branched traversal never reaches
                 // here: `classify` rejects it as `InvalidQuery` before
                 // this function runs, which is where the rule belongs —
                 // the trusted reader gets the identical rejection.
                 let _ = axis;
-                Ok(VerifiedPathQuery::BranchedAxisEntries {
+                Self::branched_axis_into_verified(
                     root_hash,
-                    branches,
-                })
+                    &trios,
+                    outcomes,
+                    branch_items,
+                    suffix,
+                    path_query,
+                )
             }
             PathQueryShape::SumBudget { .. } => {
                 let proof_v1 =
                     validated.require_v1_envelope(decode_grovedb_proof_canonical(proof)?)?;
                 let (root_hash, _, outcomes) =
                     Self::verify_proof_v1_with_axis_outcomes(&proof_v1, path_query, grove_version)?;
-                let [outcome]: [AxisWalkOutcome; 1] =
-                    outcomes.try_into().map_err(|outcomes: Vec<_>| {
-                        Error::InvalidProof(
+                let outcome = match single_outcome(outcomes) {
+                    Ok(outcome) => outcome,
+                    Err(count) => {
+                        return Err(Error::InvalidProof(
                             path_query.clone(),
                             format!(
                                 "a sum-budget read must verify exactly one window layer, got {}",
-                                outcomes.len()
+                                count
                             ),
-                        )
-                    })?;
-                if outcome.path != path_query.path {
+                        ));
+                    }
+                };
+                let AxisWalkOutcome { path, result } = outcome;
+                if path != path_query.path {
                     return Err(Error::InvalidProof(
                         path_query.clone(),
                         "the verified sum-budget window is not at the queried path".to_string(),
@@ -416,7 +321,7 @@ impl GroveDb {
                     matches,
                     total,
                     stop,
-                } = outcome.result
+                } = result
                 else {
                     return Err(Error::InvalidProof(
                         path_query.clone(),
@@ -482,6 +387,517 @@ impl GroveDb {
         trios: &[PathKeyOptionalElementTrio],
         path_query: &PathQuery,
     ) -> Result<VerifiedPathQuery, Error> {
+        let present = first_present_trio_on_path(trios, &path_query.path);
+        if present < trios.len() {
+            let (trio_path, trio_key, _) = &trios[present];
+            return Err(present_non_tree_on_path(path_query, trio_path, trio_key));
+        }
+        match &axis.traversal {
+            AxisTraversal::RankedPage { .. } => Ok(VerifiedPathQuery::AxisEntries {
+                root_hash,
+                entries: AxisEntries::empty_for_axis(axis.axis),
+                skipped: Some(0),
+            }),
+            AxisTraversal::Bounded { .. } => Ok(VerifiedPathQuery::AxisEntries {
+                root_hash,
+                entries: AxisEntries::empty_for_axis(axis.axis),
+                skipped: None,
+            }),
+            AxisTraversal::AggregateOverValueRange { .. } => Ok(VerifiedPathQuery::AxisAggregate {
+                root_hash,
+                value: 0,
+            }),
+            AxisTraversal::RankOfKey { .. } => Err(Error::InvalidProof(
+                path_query.clone(),
+                "a rank-of-key axis read has no answer over an absent path: the key has no \
+                 rank in a tree that does not exist, and the prover refuses to generate such \
+                 a proof"
+                    .to_string(),
+            )),
+        }
+    }
+
+    /// The answer of a branched axis read from its walk: one entry list
+    /// per branch key, in query order, or `None` for a branch key whose
+    /// absence the branching-level Merk proof authenticates.
+    ///
+    /// The outcomes are indexed by branch key first
+    /// ([`Self::index_branch_outcomes`]), then each branch item is
+    /// resolved against that index ([`Self::resolve_branch`]), stopping
+    /// at the first error; finally an outcome no branch item claimed is
+    /// an error. Index loops whose bodies are helpers, so no loop returns
+    /// early.
+    fn branched_axis_into_verified(
+        root_hash: CryptoHash,
+        trios: &[PathKeyOptionalElementTrio],
+        outcomes: Vec<AxisWalkOutcome>,
+        branch_items: &[QueryItem],
+        suffix: &[Vec<u8>],
+        path_query: &PathQuery,
+    ) -> Result<VerifiedPathQuery, Error> {
+        let mut by_branch_key = Self::index_branch_outcomes(outcomes, suffix, path_query)?;
+
+        // Present-element trios anywhere under a branch key that
+        // produced no outcome would mean the prover proved the
+        // branch present but omitted its axis layer — hiding
+        // entries behind a fake absence. Reject.
+        let mut branches = Vec::with_capacity(branch_items.len());
+        let mut failure = None;
+        let mut failed = false;
+        let mut i = 0;
+        while i < branch_items.len() && !failed {
+            match Self::resolve_branch(&branch_items[i], &mut by_branch_key, trios, path_query) {
+                Ok(branch) => branches.push(branch),
+                Err(e) => {
+                    failure = Some(e);
+                    failed = true;
+                }
+            }
+            i += 1;
+        }
+        if let Some(e) = failure {
+            return Err(e);
+        }
+        if !by_branch_key.is_empty() {
+            return Err(Error::InvalidProof(
+                path_query.clone(),
+                "the proof carries axis layers for branch keys the query does not name".to_string(),
+            ));
+        }
+        Ok(VerifiedPathQuery::BranchedAxisEntries {
+            root_hash,
+            branches,
+        })
+    }
+
+    /// Index a branched read's outcomes by their branch key (the segment
+    /// right after the branching prefix), in walk order, stopping at the
+    /// first outcome outside the prefix/branch/suffix structure or
+    /// repeating a branch key.
+    ///
+    /// The outcomes are consumed in order through [`reversed`] and
+    /// `Vec::pop` (the extraction has no model of `Vec`'s owning
+    /// iterator).
+    fn index_branch_outcomes(
+        outcomes: Vec<AxisWalkOutcome>,
+        suffix: &[Vec<u8>],
+        path_query: &PathQuery,
+    ) -> Result<BTreeMap<Vec<u8>, AxisWalkResult>, Error> {
+        let mut pending = reversed(outcomes);
+        let mut by_branch_key = BTreeMap::new();
+        let mut failure = None;
+        let mut failed = false;
+        while !failed && !pending.is_empty() {
+            if let Some(outcome) = pending.pop()
+                && let Err(e) =
+                    Self::index_branch_outcome(&mut by_branch_key, outcome, suffix, path_query)
+            {
+                failure = Some(e);
+                failed = true;
+            }
+        }
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(by_branch_key),
+        }
+    }
+
+    /// One outcome of [`Self::index_branch_outcomes`]: check its path is
+    /// `prefix ‖ branch_key ‖ suffix` and record it under `branch_key`,
+    /// which no earlier outcome may have used.
+    fn index_branch_outcome(
+        by_branch_key: &mut BTreeMap<Vec<u8>, AxisWalkResult>,
+        outcome: AxisWalkOutcome,
+        suffix: &[Vec<u8>],
+        path_query: &PathQuery,
+    ) -> Result<(), Error> {
+        let AxisWalkOutcome { path, result } = outcome;
+        let prefix_len = path_query.path.len();
+        let expected_len = prefix_len + 1 + suffix.len();
+        if path.len() != expected_len
+            || segments_differ_at(&path, 0, &path_query.path)
+            || segments_differ_at(&path, prefix_len + 1, suffix)
+        {
+            return Err(Error::InvalidProof(
+                path_query.clone(),
+                "a verified axis layer sits outside the branched query's \
+                 prefix/branch/suffix structure"
+                    .to_string(),
+            ));
+        }
+        let branch_key = path[prefix_len].clone();
+        if by_branch_key.insert(branch_key, result).is_some() {
+            return Err(Error::InvalidProof(
+                path_query.clone(),
+                "duplicate axis layers for one branch key".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// One branch item of a branched read: its entries (taken out of the
+    /// index), or `None` when it has no axis layer and no proven-present
+    /// trio at or under it.
+    fn resolve_branch(
+        item: &QueryItem,
+        by_branch_key: &mut BTreeMap<Vec<u8>, AxisWalkResult>,
+        trios: &[PathKeyOptionalElementTrio],
+        path_query: &PathQuery,
+    ) -> Result<(Vec<u8>, Option<AxisEntries>), Error> {
+        let QueryItem::Key(branch_key) = item else {
+            return Err(Error::CorruptedCodeExecution(
+                "branched axis read classified with a non-Key branch item",
+            ));
+        };
+        match by_branch_key.remove(branch_key) {
+            Some(AxisWalkResult::Entries { entries, .. }) => {
+                Ok((branch_key.clone(), Some(entries)))
+            }
+            Some(_) => Err(Error::InvalidProof(
+                path_query.clone(),
+                "branched axis reads verify entry-listing traversals only".to_string(),
+            )),
+            None => {
+                // No axis layer for this branch: the
+                // branching-level Merk proof must have
+                // authenticated the key's ABSENCE. Any
+                // present-element trio for the branch key
+                // itself — or anywhere under its subtree —
+                // means the proof shows the branch present
+                // while withholding its axis layer, i.e. a
+                // hidden branch dressed up as absence.
+                if branch_proven_present(trios, &path_query.path, branch_key) {
+                    return Err(Error::InvalidProof(
+                        path_query.clone(),
+                        format!(
+                            "branch key {} is proven present but its axis layer \
+                             is missing from the proof",
+                            hex::encode(branch_key),
+                        ),
+                    ));
+                }
+                Ok((branch_key.clone(), None))
+            }
+        }
+    }
+
+    /// Map a single-path axis outcome into the public result, checking
+    /// the outcome family matches the traversal.
+    fn outcome_into_verified(
+        root_hash: CryptoHash,
+        result: AxisWalkResult,
+        traversal: &AxisTraversal,
+        path_query: &PathQuery,
+    ) -> Result<VerifiedPathQuery, Error> {
+        match (result, traversal) {
+            (
+                AxisWalkResult::Entries { entries, skipped },
+                AxisTraversal::RankedPage { .. } | AxisTraversal::Bounded { .. },
+            ) => Ok(VerifiedPathQuery::AxisEntries {
+                root_hash,
+                entries,
+                skipped,
+            }),
+            (AxisWalkResult::Rank { rank }, AxisTraversal::RankOfKey { .. }) => {
+                Ok(VerifiedPathQuery::AxisRank { root_hash, rank })
+            }
+            (
+                AxisWalkResult::Aggregate { value },
+                AxisTraversal::AggregateOverValueRange { .. },
+            ) => Ok(VerifiedPathQuery::AxisAggregate { root_hash, value }),
+            _ => Err(Error::InvalidProof(
+                path_query.clone(),
+                "the verified axis outcome does not match the query's traversal".to_string(),
+            )),
+        }
+    }
+}
+
+/// The only outcome, or the number of outcomes when there is not exactly
+/// one: `<[AxisWalkOutcome; 1]>::try_from(outcomes)` with the error side
+/// reduced to the length, the only thing its callers read from it. (The
+/// `None` arm cannot happen after the length check.)
+fn single_outcome(mut outcomes: Vec<AxisWalkOutcome>) -> Result<AxisWalkOutcome, usize> {
+    if outcomes.len() != 1 {
+        return Err(outcomes.len());
+    }
+    match outcomes.pop() {
+        Some(outcome) => Ok(outcome),
+        None => Err(0),
+    }
+}
+
+/// `items` in reverse order, so that popping the result yields them in
+/// their original order.
+fn reversed<T>(mut items: Vec<T>) -> Vec<T> {
+    let mut out = Vec::with_capacity(items.len());
+    while let Some(item) = items.pop() {
+        out.push(item);
+    }
+    out
+}
+
+/// Whether `a[a_start..]` and `b` differ anywhere they overlap:
+/// `a[a_start..].iter().zip(b).any(|(x, y)| x != y)` as an index loop.
+/// The caller guarantees `a_start <= a.len()`, as the slice did.
+fn segments_differ_at(a: &[Vec<u8>], a_start: usize, b: &[Vec<u8>]) -> bool {
+    let a_rest = a.len() - a_start;
+    let n = if a_rest < b.len() { a_rest } else { b.len() };
+    let mut j = 0;
+    while j < n && a[a_start + j] == b[j] {
+        j += 1;
+    }
+    j < n
+}
+
+/// Whether some present-element trio is the branch key at the branching
+/// level (`path` / `branch_key`) or lies anywhere under `path ‖
+/// branch_key`: the `trios.iter().any(..)` of the branched read, as an
+/// index loop.
+fn branch_proven_present(
+    trios: &[PathKeyOptionalElementTrio],
+    path: &[Vec<u8>],
+    branch_key: &[u8],
+) -> bool {
+    let mut i = 0;
+    while i < trios.len() && !trio_shows_branch(&trios[i], path, branch_key) {
+        i += 1;
+    }
+    i < trios.len()
+}
+
+/// One trio of [`branch_proven_present`].
+fn trio_shows_branch(
+    trio: &PathKeyOptionalElementTrio,
+    path: &[Vec<u8>],
+    branch_key: &[u8],
+) -> bool {
+    let (trio_path, trio_key, element) = trio;
+    if element.is_none() {
+        return false;
+    }
+    // The branch key at the branching level…
+    (trio_path.as_slice() == path && trio_key.as_slice() == branch_key)
+        // …or anything below prefix/branch_key.
+        || (trio_path.len() > path.len()
+            && !segments_differ_at(trio_path, 0, path)
+            && trio_path[path.len()].as_slice() == branch_key)
+}
+
+/// Index of the first present-element trio that sits on the queried
+/// `path` (a proper prefix of it, keyed by the next segment), or
+/// `trios.len()` if there is none: the `trios.iter().find(..)` of
+/// `absent_axis_path_into_verified`, as an index loop.
+fn first_present_trio_on_path(trios: &[PathKeyOptionalElementTrio], path: &[Vec<u8>]) -> usize {
+    let mut i = 0;
+    while i < trios.len() && !trio_on_path(&trios[i], path) {
+        i += 1;
+    }
+    i
+}
+
+/// One trio of [`first_present_trio_on_path`].
+fn trio_on_path(trio: &PathKeyOptionalElementTrio, path: &[Vec<u8>]) -> bool {
+    let (trio_path, trio_key, element) = trio;
+    element.is_some()
+        && trio_path.len() < path.len()
+        && !segments_differ_at(path, 0, trio_path)
+        && path[trio_path.len()] == *trio_key
+}
+
+/// The error for a single-path axis read whose queried path runs through
+/// a present non-tree element. Error construction only (the path is
+/// rendered as hex segments), out of line and `#[cold]`; the extraction
+/// treats it as opaque.
+#[cold]
+fn present_non_tree_on_path(
+    path_query: &PathQuery,
+    trio_path: &[Vec<u8>],
+    trio_key: &[u8],
+) -> Error {
+    Error::InvalidProof(
+        path_query.clone(),
+        format!(
+            "the queried path runs through a present non-tree element at {}/{}; an \
+             axis read has no meaning there, so the path is not absent and the \
+             proof cannot answer the query",
+            trio_path
+                .iter()
+                .map(hex::encode)
+                .collect::<Vec<_>>()
+                .join("/"),
+            hex::encode(trio_key),
+        ),
+    )
+}
+
+/// `(Vec<u8>, u64)` per-key results as [`VerifiedPathQuery::AggregatePerKey`]
+/// entries, in order: the `into_iter().map(..).collect()` as an index loop.
+fn count_per_key_entries(per_key: &[(Vec<u8>, u64)]) -> Vec<(Vec<u8>, Option<u64>, Option<i64>)> {
+    let mut out = Vec::with_capacity(per_key.len());
+    let mut i = 0;
+    while i < per_key.len() {
+        let entry = &per_key[i];
+        out.push((entry.0.clone(), Some(entry.1), None));
+        i += 1;
+    }
+    out
+}
+
+/// `(Vec<u8>, i64)` per-key results as [`VerifiedPathQuery::AggregatePerKey`]
+/// entries, in order: the `into_iter().map(..).collect()` as an index loop.
+fn sum_per_key_entries(per_key: &[(Vec<u8>, i64)]) -> Vec<(Vec<u8>, Option<u64>, Option<i64>)> {
+    let mut out = Vec::with_capacity(per_key.len());
+    let mut i = 0;
+    while i < per_key.len() {
+        let entry = &per_key[i];
+        out.push((entry.0.clone(), None, Some(entry.1)));
+        i += 1;
+    }
+    out
+}
+
+/// `(Vec<u8>, u64, i64)` per-key results as [`VerifiedPathQuery::AggregatePerKey`]
+/// entries, in order: the `into_iter().map(..).collect()` as an index loop.
+fn count_and_sum_per_key_entries(
+    per_key: &[(Vec<u8>, u64, i64)],
+) -> Vec<(Vec<u8>, Option<u64>, Option<i64>)> {
+    let mut out = Vec::with_capacity(per_key.len());
+    let mut i = 0;
+    while i < per_key.len() {
+        let entry = &per_key[i];
+        out.push((entry.0.clone(), Some(entry.1), Some(entry.2)));
+        i += 1;
+    }
+    out
+}
+
+/// Differential tests for the pieces of `verify_path_query` reshaped for
+/// the Rust-to-Lean extraction. Each `ref_` function is the previous code,
+/// verbatim except for its name and, for the branched read, being lifted
+/// out of its `match` arm into a function of the arm's inputs.
+#[cfg(test)]
+mod reference_tests {
+    use grovedb_merk::proofs::query::IndexAxis;
+
+    use super::*;
+    use crate::Element;
+
+    #[allow(clippy::too_many_arguments)]
+    fn ref_branched(
+        root_hash: CryptoHash,
+        trios: Vec<PathKeyOptionalElementTrio>,
+        outcomes: Vec<AxisWalkOutcome>,
+        branch_items: &[QueryItem],
+        suffix: &[Vec<u8>],
+        path_query: &PathQuery,
+    ) -> Result<VerifiedPathQuery, Error> {
+        // Index outcomes by their branch key (the segment right
+        // after the branching prefix).
+        let prefix_len = path_query.path.len();
+        let mut by_branch_key: std::collections::BTreeMap<Vec<u8>, AxisWalkResult> =
+            std::collections::BTreeMap::new();
+        for outcome in outcomes {
+            let expected_len = prefix_len + 1 + suffix.len();
+            if outcome.path.len() != expected_len
+                || outcome.path[..prefix_len]
+                    .iter()
+                    .zip(&path_query.path)
+                    .any(|(a, b)| a != b)
+                || outcome.path[prefix_len + 1..]
+                    .iter()
+                    .zip(suffix)
+                    .any(|(a, b)| a != b)
+            {
+                return Err(Error::InvalidProof(
+                    path_query.clone(),
+                    "a verified axis layer sits outside the branched query's \
+                     prefix/branch/suffix structure"
+                        .to_string(),
+                ));
+            }
+            let branch_key = outcome.path[prefix_len].clone();
+            if by_branch_key.insert(branch_key, outcome.result).is_some() {
+                return Err(Error::InvalidProof(
+                    path_query.clone(),
+                    "duplicate axis layers for one branch key".to_string(),
+                ));
+            }
+        }
+
+        // Present-element trios anywhere under a branch key that
+        // produced no outcome would mean the prover proved the
+        // branch present but omitted its axis layer — hiding
+        // entries behind a fake absence. Reject.
+        let mut branches = Vec::with_capacity(branch_items.len());
+        for item in branch_items {
+            let grovedb_merk::proofs::query::query_item::QueryItem::Key(branch_key) = item else {
+                return Err(Error::CorruptedCodeExecution(
+                    "branched axis read classified with a non-Key branch item",
+                ));
+            };
+            match by_branch_key.remove(branch_key) {
+                Some(AxisWalkResult::Entries { entries, .. }) => {
+                    branches.push((branch_key.clone(), Some(entries)));
+                }
+                Some(_) => {
+                    return Err(Error::InvalidProof(
+                        path_query.clone(),
+                        "branched axis reads verify entry-listing traversals only".to_string(),
+                    ));
+                }
+                None => {
+                    // No axis layer for this branch: the
+                    // branching-level Merk proof must have
+                    // authenticated the key's ABSENCE. Any
+                    // present-element trio for the branch key
+                    // itself — or anywhere under its subtree —
+                    // means the proof shows the branch present
+                    // while withholding its axis layer, i.e. a
+                    // hidden branch dressed up as absence.
+                    let present = trios.iter().any(|(trio_path, trio_key, element)| {
+                        if element.is_none() {
+                            return false;
+                        }
+                        // The branch key at the branching level…
+                        (trio_path == &path_query.path && trio_key == branch_key)
+                            // …or anything below prefix/branch_key.
+                            || (trio_path.len() > path_query.path.len()
+                                && trio_path[..path_query.path.len()] == path_query.path
+                                && trio_path[path_query.path.len()] == *branch_key)
+                    });
+                    if present {
+                        return Err(Error::InvalidProof(
+                            path_query.clone(),
+                            format!(
+                                "branch key {} is proven present but its axis layer \
+                                 is missing from the proof",
+                                hex::encode(branch_key),
+                            ),
+                        ));
+                    }
+                    branches.push((branch_key.clone(), None));
+                }
+            }
+        }
+        if !by_branch_key.is_empty() {
+            return Err(Error::InvalidProof(
+                path_query.clone(),
+                "the proof carries axis layers for branch keys the query does not name".to_string(),
+            ));
+        }
+        Ok(VerifiedPathQuery::BranchedAxisEntries {
+            root_hash,
+            branches,
+        })
+    }
+
+    fn ref_absent_axis_path_into_verified(
+        root_hash: CryptoHash,
+        axis: &AxisQuery,
+        trios: &[PathKeyOptionalElementTrio],
+        path_query: &PathQuery,
+    ) -> Result<VerifiedPathQuery, Error> {
         let on_the_queried_path = |trio_path: &[Vec<u8>], trio_key: &[u8]| {
             trio_path.len() < path_query.path.len()
                 && path_query.path[..trio_path.len()] == *trio_path
@@ -532,34 +948,251 @@ impl GroveDb {
         }
     }
 
-    /// Map a single-path axis outcome into the public result, checking
-    /// the outcome family matches the traversal.
-    fn outcome_into_verified(
-        root_hash: CryptoHash,
-        result: AxisWalkResult,
-        traversal: &AxisTraversal,
-        path_query: &PathQuery,
-    ) -> Result<VerifiedPathQuery, Error> {
-        match (result, traversal) {
-            (
-                AxisWalkResult::Entries { entries, skipped },
-                AxisTraversal::RankedPage { .. } | AxisTraversal::Bounded { .. },
-            ) => Ok(VerifiedPathQuery::AxisEntries {
-                root_hash,
-                entries,
-                skipped,
-            }),
-            (AxisWalkResult::Rank { rank }, AxisTraversal::RankOfKey { .. }) => {
-                Ok(VerifiedPathQuery::AxisRank { root_hash, rank })
+    fn seg(s: &[u8]) -> Vec<u8> {
+        s.to_vec()
+    }
+
+    /// Outcome `i` of a fixed pool: well-formed paths `r/k/s` for three
+    /// branch keys and each result family, and paths off the structure.
+    fn outcome(i: usize) -> AxisWalkOutcome {
+        let entries = |axis| AxisWalkResult::Entries {
+            entries: AxisEntries::empty_for_axis(axis),
+            skipped: None,
+        };
+        let (path, result) = match i {
+            0 => (
+                vec![seg(b"r"), seg(b"a"), seg(b"s")],
+                entries(IndexAxis::Count),
+            ),
+            1 => (
+                vec![seg(b"r"), seg(b"b"), seg(b"s")],
+                entries(IndexAxis::Sum),
+            ),
+            2 => (
+                vec![seg(b"r"), seg(b"c"), seg(b"s")],
+                entries(IndexAxis::Avg),
+            ),
+            3 => (
+                vec![seg(b"r"), seg(b"a"), seg(b"s")],
+                AxisWalkResult::Rank { rank: 1 },
+            ),
+            4 => (vec![seg(b"r"), seg(b"b")], entries(IndexAxis::Count)),
+            5 => (
+                vec![seg(b"x"), seg(b"a"), seg(b"s")],
+                entries(IndexAxis::Count),
+            ),
+            _ => (
+                vec![seg(b"r"), seg(b"a"), seg(b"t")],
+                entries(IndexAxis::Count),
+            ),
+        };
+        AxisWalkOutcome { path, result }
+    }
+
+    const POOL: usize = 7;
+
+    fn outcome_lists() -> Vec<Vec<usize>> {
+        let mut lists = vec![vec![]];
+        let mut last = vec![vec![]];
+        for _ in 0..3 {
+            let mut longer = Vec::new();
+            for l in &last {
+                for i in 0..POOL {
+                    let mut l2: Vec<usize> = l.clone();
+                    l2.push(i);
+                    longer.push(l2);
+                }
             }
-            (
-                AxisWalkResult::Aggregate { value },
-                AxisTraversal::AggregateOverValueRange { .. },
-            ) => Ok(VerifiedPathQuery::AxisAggregate { root_hash, value }),
-            _ => Err(Error::InvalidProof(
-                path_query.clone(),
-                "the verified axis outcome does not match the query's traversal".to_string(),
-            )),
+            lists.extend(longer.iter().cloned());
+            last = longer;
+        }
+        lists
+    }
+
+    fn branch_item_lists() -> Vec<Vec<QueryItem>> {
+        let key = |k: &[u8]| QueryItem::Key(k.to_vec());
+        vec![
+            vec![],
+            vec![key(b"a")],
+            vec![key(b"a"), key(b"b")],
+            vec![key(b"b"), key(b"a"), key(b"c")],
+            vec![key(b"a"), key(b"a")],
+            vec![key(b"d")],
+            vec![QueryItem::Range(b"a".to_vec()..b"b".to_vec())],
+        ]
+    }
+
+    fn trio_lists() -> Vec<Vec<PathKeyOptionalElementTrio>> {
+        let item = || Some(Element::new_item(b"v".to_vec()));
+        let r = || vec![seg(b"r")];
+        vec![
+            vec![],
+            vec![(r(), seg(b"a"), None)],
+            vec![(r(), seg(b"a"), item())],
+            vec![(r(), seg(b"d"), item())],
+            vec![(vec![seg(b"r"), seg(b"d"), seg(b"s")], seg(b"x"), item())],
+            vec![(vec![seg(b"r"), seg(b"d")], seg(b"x"), None)],
+            vec![
+                (vec![seg(b"q"), seg(b"d")], seg(b"x"), item()),
+                (r(), seg(b"b"), item()),
+            ],
+            vec![(vec![], seg(b"r"), item())],
+        ]
+    }
+
+    #[test]
+    fn branched_read_matches_reference() {
+        let path_query = PathQuery::new_single_key(vec![seg(b"r")], b"k".to_vec());
+        let suffix = vec![seg(b"s")];
+        let mut cases = 0;
+        for outcomes in outcome_lists() {
+            for items in branch_item_lists() {
+                for trios in trio_lists() {
+                    let got = GroveDb::branched_axis_into_verified(
+                        [1; 32],
+                        &trios,
+                        outcomes.iter().map(|&i| outcome(i)).collect(),
+                        &items,
+                        &suffix,
+                        &path_query,
+                    );
+                    let want = ref_branched(
+                        [1; 32],
+                        trios.clone(),
+                        outcomes.iter().map(|&i| outcome(i)).collect(),
+                        &items,
+                        &suffix,
+                        &path_query,
+                    );
+                    assert_eq!(
+                        format!("{got:?}"),
+                        format!("{want:?}"),
+                        "{outcomes:?} {items:?} {trios:?}"
+                    );
+                    cases += 1;
+                }
+            }
+        }
+        assert!(cases > 20_000);
+    }
+
+    #[test]
+    fn absent_axis_path_matches_reference() {
+        let traversals = [
+            AxisTraversal::RankedPage { k: 1, offset: 0 },
+            AxisTraversal::Bounded {
+                lo: 0,
+                hi: 1,
+                limit: 1,
+            },
+            AxisTraversal::RankOfKey { key: b"k".to_vec() },
+            AxisTraversal::AggregateOverValueRange {
+                lo: 0,
+                hi: 1,
+                fold: grovedb_merk::proofs::query::AggregateFold::Total,
+            },
+        ];
+        let item = || Some(Element::new_item(b"v".to_vec()));
+        let trio_lists: Vec<Vec<PathKeyOptionalElementTrio>> = vec![
+            vec![],
+            vec![(vec![], seg(b"a"), item())],
+            vec![(vec![], seg(b"a"), None)],
+            vec![
+                (vec![], seg(b"z"), item()),
+                (vec![seg(b"a")], seg(b"b"), item()),
+            ],
+            vec![
+                (vec![seg(b"a")], seg(b"z"), item()),
+                (vec![seg(b"a"), seg(b"b")], seg(b"c"), item()),
+            ],
+            vec![(vec![seg(b"a"), seg(b"b")], seg(b"c"), item())],
+            vec![(vec![seg(b"x")], seg(b"b"), item())],
+        ];
+        let paths = [
+            vec![],
+            vec![seg(b"a")],
+            vec![seg(b"a"), seg(b"b")],
+            vec![seg(b"a"), seg(b"b"), seg(b"c")],
+        ];
+        for path in paths {
+            let path_query = PathQuery::new_single_key(path, b"k".to_vec());
+            for traversal in &traversals {
+                let axis = AxisQuery {
+                    axis: IndexAxis::Count,
+                    traversal: traversal.clone(),
+                    descending: false,
+                    projection: grovedb_merk::proofs::query::AxisProjection::Entries,
+                };
+                for trios in &trio_lists {
+                    let got =
+                        GroveDb::absent_axis_path_into_verified([2; 32], &axis, trios, &path_query);
+                    let want =
+                        ref_absent_axis_path_into_verified([2; 32], &axis, trios, &path_query);
+                    assert_eq!(format!("{got:?}"), format!("{want:?}"), "{trios:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_outcome_matches_array_try_from() {
+        for n in 0..4 {
+            let got = single_outcome((0..n).map(outcome).collect());
+            let want = <[AxisWalkOutcome; 1]>::try_from((0..n).map(outcome).collect::<Vec<_>>());
+            match (got, want) {
+                (Ok(a), Ok([b])) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+                (Err(len), Err(v)) => assert_eq!(len, v.len()),
+                (a, b) => panic!("{a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn per_key_entries_match_iterator_maps() {
+        let count: Vec<(Vec<u8>, u64)> = vec![(seg(b"a"), 1), (seg(b"b"), 2)];
+        let want: Vec<_> = count
+            .clone()
+            .into_iter()
+            .map(|(key, count)| (key, Some(count), None))
+            .collect();
+        assert_eq!(count_per_key_entries(&count), want);
+        let sum: Vec<(Vec<u8>, i64)> = vec![(seg(b"a"), -1), (seg(b"b"), 2)];
+        let want: Vec<_> = sum
+            .clone()
+            .into_iter()
+            .map(|(key, sum)| (key, None, Some(sum)))
+            .collect();
+        assert_eq!(sum_per_key_entries(&sum), want);
+        let both: Vec<(Vec<u8>, u64, i64)> = vec![(seg(b"a"), 1, -1), (seg(b"b"), 2, 2)];
+        let want: Vec<_> = both
+            .clone()
+            .into_iter()
+            .map(|(key, count, sum)| (key, Some(count), Some(sum)))
+            .collect();
+        assert_eq!(count_and_sum_per_key_entries(&both), want);
+        assert!(count_per_key_entries(&[]).is_empty());
+    }
+
+    #[test]
+    fn segments_differ_at_matches_zip_any() {
+        let lists: Vec<Vec<Vec<u8>>> = vec![
+            vec![],
+            vec![seg(b"a")],
+            vec![seg(b"b")],
+            vec![seg(b"a"), seg(b"b")],
+            vec![seg(b"a"), seg(b"c")],
+            vec![seg(b"b"), seg(b"a"), seg(b"c")],
+        ];
+        for a in &lists {
+            for b in &lists {
+                for start in 0..=a.len() {
+                    assert_eq!(
+                        segments_differ_at(a, start, b),
+                        a[start..].iter().zip(b).any(|(x, y)| x != y),
+                        "{a:?} {start} {b:?}"
+                    );
+                }
+            }
         }
     }
 }
