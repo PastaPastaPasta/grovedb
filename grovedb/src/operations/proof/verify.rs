@@ -4,7 +4,6 @@ use grovedb_merk::{
     calculate_chunk_depths, calculate_max_tree_depth_from_count,
     element::tree_type::ElementTreeTypeExtensions,
     proofs::{
-        execute,
         query::{
             PathKey, ProvedKeyOptionalValue, QueryProofVerify, SumBudgetRead, VerifyOptions,
             PROOF_VERSION_LATEST,
@@ -4631,135 +4630,79 @@ impl GroveDb {
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
         // Collect layer info as we walk down the path for later verification
-        struct LayerInfo {
-            value_bytes: Vec<u8>,
-            expected_hash: CryptoHash,
-            /// The root hash of this layer's merk tree (used as child hash for
-            /// parent layer)
-            layer_root_hash: CryptoHash,
-        }
-        let mut layer_infos: Vec<LayerInfo> = Vec::new();
+        let mut layer_infos: Vec<TrunkLayerInfo> = Vec::new();
 
         let mut current_layer = &proof.root_layer;
         let mut current_path: Vec<Vec<u8>> = Vec::new();
         let mut count: Option<u64> = None;
         let mut grovedb_root_hash: Option<CryptoHash> = None;
 
-        // Walk through each path segment, verifying layer proofs
-        for (i, path_segment) in query.path.iter().enumerate() {
-            // Create a simple key query for this path segment
-            let key_query = Query {
-                items: vec![grovedb_merk::proofs::query::QueryItem::Key(
-                    path_segment.clone(),
-                )],
-                ..Default::default()
-            };
-
-            // Execute the proof to verify and get the root hash
-            let (layer_root_hash, result) = key_query
-                .execute_proof(
-                    &current_layer.merk_proof,
-                    None,
-                    true,
-                    0, // V0 proof: allow items in value hash nodes
-                )
-                .unwrap()
-                .map_err(|e| {
-                    Error::InvalidProof(
-                        PathQuery::new_unsized(current_path.clone(), key_query.clone()),
-                        format!("Invalid proof at path layer {}: {}", i, e),
-                    )
-                })?;
-
-            // Store the root hash of the first layer as the GroveDB root hash
-            if i == 0 {
-                grovedb_root_hash = Some(layer_root_hash);
-            }
-
-            // Find the element for this key in the result set
-            let mut found_value_bytes: Option<Vec<u8>> = None;
-            let mut found_hash: Option<CryptoHash> = None;
-
-            for proved_key_value in &result.result_set {
-                if proved_key_value.key == *path_segment {
-                    found_hash = Some(proved_key_value.proof);
-                    if let Some(value_bytes) = &proved_key_value.value {
-                        found_value_bytes = Some(value_bytes.clone());
-
-                        // On the last path segment, extract the count from the CountTree element
-                        if i == query.path.len() - 1 {
-                            let element = Element::deserialize(value_bytes, grove_version)?;
-                            count = Self::extract_count_from_element(&element);
-                        }
+        // Walk through each path segment, verifying layer proofs. An index
+        // loop over a per-segment helper; the first failing segment's
+        // error ends the walk.
+        let mut failure = None;
+        let mut failed = false;
+        let mut i = 0;
+        while i < query.path.len() && !failed {
+            let is_last = i == query.path.len() - 1;
+            match Self::trunk_path_layer_v0(
+                current_layer,
+                &query.path[i],
+                i,
+                is_last,
+                &current_path,
+                grove_version,
+            ) {
+                Ok((layer_info, layer_count, lower_layer)) => {
+                    // Store the root hash of the first layer as the GroveDB root hash
+                    if i == 0 {
+                        grovedb_root_hash = Some(layer_info.layer_root_hash);
                     }
-                    break;
+                    // On the last path segment, the count of the CountTree element
+                    if is_last {
+                        count = layer_count;
+                    }
+                    layer_infos.push(layer_info);
+                    current_layer = lower_layer;
+                    current_path.push(query.path[i].clone());
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    failed = true;
                 }
             }
-
-            let value_bytes = found_value_bytes.ok_or_else(|| {
-                Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
-                    format!(
-                        "Path segment {} not found in proof result",
-                        hex::encode(path_segment)
-                    ),
-                )
-            })?;
-
-            let expected_hash = found_hash.ok_or_else(|| {
-                Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
-                    format!(
-                        "No hash found for path segment {}",
-                        hex::encode(path_segment)
-                    ),
-                )
-            })?;
-
-            // Store layer info for later verification
-            layer_infos.push(LayerInfo {
-                value_bytes,
-                expected_hash,
-                layer_root_hash,
-            });
-
-            // Move to the next layer
-            current_layer = current_layer
-                .lower_layers
-                .get(path_segment)
-                .ok_or_else(|| {
-                    Error::InvalidProof(
-                        PathQuery::new_unsized(current_path.clone(), key_query),
-                        format!(
-                            "Missing lower layer for path segment {}",
-                            hex::encode(path_segment)
-                        ),
-                    )
-                })?;
-
-            current_path.push(path_segment.clone());
+            i += 1;
+        }
+        if let Some(e) = failure {
+            return Err(e);
         }
 
         // Ensure we got a count from the element
-        let count = count.ok_or_else(|| {
-            Error::InvalidProof(
-                PathQuery::new_unsized(current_path.clone(), Query::default()),
-                "Could not extract count from path - target is not a count tree element"
-                    .to_string(),
-            )
-        })?;
+        let count = match count {
+            Some(count) => count,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    "Could not extract count from path - target is not a count tree element"
+                        .to_string(),
+                ));
+            }
+        };
 
         // Empty tree — return an empty result.
         // The parent layers' merk proofs already verified the hash chain integrity,
         // including the element's value_hash. The count is authenticated by the
         // parent proof. With count==0 there is no child data to verify against.
         if count == 0 {
-            let grovedb_root_hash = grovedb_root_hash.ok_or_else(|| {
-                Error::InvalidProof(
-                    PathQuery::new_unsized(Vec::new(), Query::default()),
-                    "Empty path - no root hash computed".to_string(),
-                )
-            })?;
+            let grovedb_root_hash = match grovedb_root_hash {
+                Some(hash) => hash,
+                None => {
+                    return Err(Error::InvalidProof(
+                        PathQuery::new_unsized(Vec::new(), Query::default()),
+                        "Empty path - no root hash computed".to_string(),
+                    ));
+                }
+            };
 
             return Ok((
                 grovedb_root_hash,
@@ -4774,15 +4717,27 @@ impl GroveDb {
         }
 
         let tree_depth = calculate_max_tree_depth_from_count(count);
-        let chunk_depths = calculate_chunk_depths(tree_depth, query.max_depth)
-            .map_err(|e| Error::CorruptedData(format!("invalid chunk depth parameters: {}", e)))?;
+        let chunk_depths = match calculate_chunk_depths(tree_depth, query.max_depth) {
+            Ok(chunk_depths) => chunk_depths,
+            Err(e) => {
+                return Err(Error::CorruptedData(format!(
+                    "invalid chunk depth parameters: {}",
+                    e
+                )));
+            }
+        };
 
         // Now we're at the target layer - decode and execute the trunk proof
         let mut decoder = Decoder::new(&current_layer.merk_proof);
-        let ops: Vec<Op> = decoder
-            .by_ref()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::CorruptedData(format!("Failed to decode trunk proof: {}", e)))?;
+        let ops = match decode_chunk_ops(&mut decoder) {
+            Ok(ops) => ops,
+            Err(e) => {
+                return Err(Error::CorruptedData(format!(
+                    "Failed to decode trunk proof: {}",
+                    e
+                )));
+            }
+        };
         if decoder.remaining_bytes() > 0 {
             return Err(Error::CorruptedData(format!(
                 "Trunk proof has {} unconsumed trailing bytes",
@@ -4792,45 +4747,25 @@ impl GroveDb {
 
         // Execute the proof to build the tree structure and get its root hash
         // Use collapse=false to preserve the full tree structure for element extraction
-        let target_tree = execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))
-            .unwrap()
-            .map_err(|e| {
-                Error::InvalidProof(
+        let target_tree = match execute_chunk_ops(&ops).unwrap() {
+            Ok(target_tree) => target_tree,
+            Err(e) => {
+                return Err(Error::InvalidProof(
                     PathQuery::new_unsized(current_path.clone(), Query::default()),
                     format!("Failed to execute trunk proof: {}", e),
-                )
-            })?;
+                ));
+            }
+        };
 
-        let mut lower_hash = target_tree.hash().unwrap();
+        let lower_hash = target_tree.hash().unwrap();
 
         // Verify the cryptographic chain from trunk up through all layers
         // Walk backwards through the layer infos, verifying each step
-        for (i, layer_info) in layer_infos.iter().rev().enumerate() {
-            let combined_hash =
-                combine_hash(value_hash(&layer_info.value_bytes).value(), &lower_hash)
-                    .value()
-                    .to_owned();
-
-            if combined_hash != layer_info.expected_hash {
-                return Err(Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), Query::default()),
-                    format!(
-                        "Hash mismatch at layer {} from bottom: expected {}, got {}",
-                        i,
-                        hex::encode(layer_info.expected_hash),
-                        hex::encode(combined_hash)
-                    ),
-                ));
-            }
-
-            // For the next iteration, use this layer's merk tree root hash.
-            // This is what the parent layer uses as the child hash for this subtree.
-            lower_hash = layer_info.layer_root_hash;
-        }
+        check_trunk_chain_v0(&layer_infos, lower_hash, &current_path)?;
 
         // Extract elements and leaf keys from the proof tree
         // The max depth for the trunk is the first chunk depth
-        let max_depth = chunk_depths.first().copied().unwrap_or(0) as usize;
+        let max_depth = first_chunk_depth(&chunk_depths);
         let mut elements = BTreeMap::new();
         let mut leaf_keys = BTreeMap::new();
         Self::extract_elements_and_leaf_keys(
@@ -4842,12 +4777,15 @@ impl GroveDb {
             grove_version,
         )?;
 
-        let grovedb_root_hash = grovedb_root_hash.ok_or_else(|| {
-            Error::InvalidProof(
-                PathQuery::new_unsized(Vec::new(), Query::default()),
-                "Empty path - no root hash computed".to_string(),
-            )
-        })?;
+        let grovedb_root_hash = match grovedb_root_hash {
+            Some(hash) => hash,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(Vec::new(), Query::default()),
+                    "Empty path - no root hash computed".to_string(),
+                ));
+            }
+        };
 
         let trunk_result = GroveTrunkQueryResult {
             elements,
@@ -4858,6 +4796,125 @@ impl GroveDb {
         };
 
         Ok((grovedb_root_hash, trunk_result))
+    }
+
+    /// One path segment of the V0 trunk walk (the body of its path loop):
+    /// prove `path_segment` in `layer`, then return the layer's record,
+    /// the count of the target element (meaningful only when `is_last`),
+    /// and the next layer. Errors in the order the loop raised them.
+    fn trunk_path_layer_v0<'a>(
+        layer: &'a MerkOnlyLayerProof,
+        path_segment: &Vec<u8>,
+        i: usize,
+        is_last: bool,
+        current_path: &[Vec<u8>],
+        grove_version: &GroveVersion,
+    ) -> Result<(TrunkLayerInfo, Option<u64>, &'a MerkOnlyLayerProof), Error> {
+        // Create a simple key query for this path segment
+        let key_query = single_key_query(path_segment);
+
+        // Execute the proof to verify and get the root hash
+        let (layer_root_hash, result) = match key_query
+            .execute_proof(
+                &layer.merk_proof,
+                None,
+                true,
+                0, // V0 proof: allow items in value hash nodes
+            )
+            .unwrap()
+        {
+            Ok(executed) => executed,
+            Err(e) => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query.clone()),
+                    format!("Invalid proof at path layer {}: {}", i, e),
+                ));
+            }
+        };
+
+        // Find the element for this key in the result set
+        let (found_value_bytes, found_hash, count) =
+            Self::trunk_segment_row(&result.result_set, path_segment, is_last, grove_version)?;
+
+        let value_bytes = match found_value_bytes {
+            Some(value_bytes) => value_bytes,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query.clone()),
+                    format!(
+                        "Path segment {} not found in proof result",
+                        hex::encode(path_segment)
+                    ),
+                ));
+            }
+        };
+
+        let expected_hash = match found_hash {
+            Some(expected_hash) => expected_hash,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query.clone()),
+                    format!(
+                        "No hash found for path segment {}",
+                        hex::encode(path_segment)
+                    ),
+                ));
+            }
+        };
+
+        // Move to the next layer
+        let lower_layer = match layer.lower_layers.get(path_segment) {
+            Some(lower_layer) => lower_layer,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query),
+                    format!(
+                        "Missing lower layer for path segment {}",
+                        hex::encode(path_segment)
+                    ),
+                ));
+            }
+        };
+
+        Ok((
+            TrunkLayerInfo {
+                value_bytes,
+                expected_hash,
+                layer_root_hash,
+            },
+            count,
+            lower_layer,
+        ))
+    }
+
+    /// The row a trunk path layer proved for `path_segment`: the first row
+    /// with that key, as `(value bytes, value hash, count)`. `None`s when
+    /// there is no such row (or it carries no value). When `is_last`, the
+    /// value is deserialized and the count read from it, so a value that
+    /// fails to deserialize is an error, as in the loop this came from.
+    fn trunk_segment_row(
+        rows: &[ProvedKeyOptionalValue],
+        path_segment: &[u8],
+        is_last: bool,
+        grove_version: &GroveVersion,
+    ) -> Result<(Option<Vec<u8>>, Option<CryptoHash>, Option<u64>), Error> {
+        let found = super::aggregate_common::first_row_with_key(rows, path_segment);
+        if found == rows.len() {
+            return Ok((None, None, None));
+        }
+        let row = &rows[found];
+        match &row.value {
+            Some(value_bytes) => {
+                let count = if is_last {
+                    let element = Element::deserialize(value_bytes, grove_version)?;
+                    Self::extract_count_from_element(&element)
+                } else {
+                    None
+                };
+                Ok((Some(value_bytes.clone()), Some(row.proof), count))
+            }
+            None => Ok((None, Some(row.proof), None)),
+        }
     }
 
     /// V1 trunk chunk proof verifier.
@@ -4881,120 +4938,62 @@ impl GroveDb {
         }
 
         // Collect layer info as we walk down the path for later verification
-        struct LayerInfo {
-            value_bytes: Vec<u8>,
-            expected_hash: CryptoHash,
-            /// The root hash of this layer's merk tree
-            layer_root_hash: CryptoHash,
-        }
-        let mut layer_infos: Vec<LayerInfo> = Vec::new();
+        let mut layer_infos: Vec<TrunkLayerInfo> = Vec::new();
 
         let mut current_layer = &proof.root_layer;
         let mut current_path: Vec<Vec<u8>> = Vec::new();
         let mut count: Option<u64> = None;
         let mut grovedb_root_hash: CryptoHash = [0u8; 32];
 
-        // Walk through each path segment, verifying layer proofs
-        for (i, path_segment) in query.path.iter().enumerate() {
-            let key_query = Query {
-                items: vec![grovedb_merk::proofs::query::QueryItem::Key(
-                    path_segment.clone(),
-                )],
-                ..Default::default()
-            };
-
-            // Extract merk bytes from ProofBytes::Merk
-            let merk_proof_bytes = match &current_layer.merk_proof {
-                ProofBytes::Merk(bytes) => bytes,
-                _ => {
-                    return Err(Error::InvalidProof(
-                        PathQuery::new_unsized(current_path.clone(), key_query),
-                        "V1 trunk proof: expected Merk proof bytes at path layer".to_string(),
-                    ));
-                }
-            };
-
-            let (layer_root_hash, result) = key_query
-                .execute_proof(merk_proof_bytes, None, true, PROOF_VERSION_LATEST)
-                .unwrap()
-                .map_err(|e| {
-                    Error::InvalidProof(
-                        PathQuery::new_unsized(current_path.clone(), key_query.clone()),
-                        format!("Invalid V1 trunk proof at path layer {}: {}", i, e),
-                    )
-                })?;
-
-            if i == 0 {
-                grovedb_root_hash = layer_root_hash;
-            }
-
-            let mut found_value_bytes: Option<Vec<u8>> = None;
-            let mut found_hash: Option<CryptoHash> = None;
-
-            for proved_key_value in &result.result_set {
-                if proved_key_value.key == *path_segment {
-                    found_hash = Some(proved_key_value.proof);
-                    if let Some(value_bytes) = &proved_key_value.value {
-                        found_value_bytes = Some(value_bytes.clone());
-
-                        if i == query.path.len() - 1 {
-                            let element = Element::deserialize(value_bytes, grove_version)?;
-                            count = Self::extract_count_from_element(&element);
-                        }
+        // Walk through each path segment, verifying layer proofs. An index
+        // loop over a per-segment helper; the first failing segment's
+        // error ends the walk.
+        let mut failure = None;
+        let mut failed = false;
+        let mut i = 0;
+        while i < query.path.len() && !failed {
+            let is_last = i == query.path.len() - 1;
+            match Self::trunk_path_layer_v1(
+                current_layer,
+                &query.path[i],
+                i,
+                is_last,
+                &current_path,
+                grove_version,
+            ) {
+                Ok((layer_info, layer_count, lower_layer)) => {
+                    if i == 0 {
+                        grovedb_root_hash = layer_info.layer_root_hash;
                     }
-                    break;
+                    if is_last {
+                        count = layer_count;
+                    }
+                    layer_infos.push(layer_info);
+                    current_layer = lower_layer;
+                    current_path.push(query.path[i].clone());
+                }
+                Err(e) => {
+                    failure = Some(e);
+                    failed = true;
                 }
             }
-
-            let value_bytes = found_value_bytes.ok_or_else(|| {
-                Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
-                    format!(
-                        "V1 trunk: path segment {} not found in proof result",
-                        hex::encode(path_segment)
-                    ),
-                )
-            })?;
-
-            let expected_hash = found_hash.ok_or_else(|| {
-                Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
-                    format!(
-                        "V1 trunk: no hash found for path segment {}",
-                        hex::encode(path_segment)
-                    ),
-                )
-            })?;
-
-            layer_infos.push(LayerInfo {
-                value_bytes,
-                expected_hash,
-                layer_root_hash,
-            });
-
-            current_layer = current_layer
-                .lower_layers
-                .get(path_segment)
-                .ok_or_else(|| {
-                    Error::InvalidProof(
-                        PathQuery::new_unsized(current_path.clone(), key_query),
-                        format!(
-                            "V1 trunk: missing lower layer for path segment {}",
-                            hex::encode(path_segment)
-                        ),
-                    )
-                })?;
-
-            current_path.push(path_segment.clone());
+            i += 1;
+        }
+        if let Some(e) = failure {
+            return Err(e);
         }
 
-        let count = count.ok_or_else(|| {
-            Error::InvalidProof(
-                PathQuery::new_unsized(current_path.clone(), Query::default()),
-                "V1 trunk: could not extract count from path - target is not a count tree element"
-                    .to_string(),
-            )
-        })?;
+        let count = match count {
+            Some(count) => count,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    "V1 trunk: could not extract count from path - target is not a count tree \
+                     element"
+                        .to_string(),
+                ));
+            }
+        };
 
         // Extract merk bytes from the target layer
         let target_merk_bytes = match &current_layer.merk_proof {
@@ -5009,75 +5008,14 @@ impl GroveDb {
 
         // Determine the lower hash -- always computed, even for empty trees.
         // This is the critical security fix: V0 skipped this for count==0.
-        let (lower_hash, target_tree_opt) = if count == 0 {
-            if !target_merk_bytes.is_empty() {
-                return Err(Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), Query::default()),
-                    format!(
-                        "V1 trunk: target layer has {} bytes but count is 0 (expected empty)",
-                        target_merk_bytes.len()
-                    ),
-                ));
-            }
-            (NULL_HASH, None)
-        } else {
-            let tree_depth = calculate_max_tree_depth_from_count(count);
-            let _chunk_depths =
-                calculate_chunk_depths(tree_depth, query.max_depth).map_err(|e| {
-                    Error::CorruptedData(format!("invalid chunk depth parameters: {}", e))
-                })?;
-
-            let mut decoder = Decoder::new(target_merk_bytes);
-            let ops: Vec<Op> = decoder
-                .by_ref()
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    Error::CorruptedData(format!("Failed to decode V1 trunk proof: {}", e))
-                })?;
-            if decoder.remaining_bytes() > 0 {
-                return Err(Error::CorruptedData(format!(
-                    "V1 trunk proof has {} unconsumed trailing bytes",
-                    decoder.remaining_bytes()
-                )));
-            }
-
-            let target_tree = execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))
-                .unwrap()
-                .map_err(|e| {
-                    Error::InvalidProof(
-                        PathQuery::new_unsized(current_path.clone(), Query::default()),
-                        format!("Failed to execute V1 trunk proof: {}", e),
-                    )
-                })?;
-
-            let hash = target_tree.hash().unwrap();
-            (hash, Some(target_tree))
-        };
+        let (lower_hash, target_tree_opt) =
+            Self::trunk_target_v1(target_merk_bytes, count, query, &current_path)?;
 
         // ALWAYS verify the cryptographic chain from trunk up through all layers.
         // This is the security fix: V0 skipped this when count==0, allowing
         // an attacker to forge the element bytes while keeping the original
         // value_hash in a KVValueHash node.
-        let mut current_lower_hash = lower_hash;
-        for (i, layer_info) in layer_infos.iter().rev().enumerate() {
-            let parent = ParentCommitment {
-                value_bytes: &layer_info.value_bytes,
-                value_hash: &layer_info.expected_hash,
-            };
-            parent.check(&current_lower_hash).map_err(|combined_hash| {
-                Error::InvalidProof(
-                    PathQuery::new_unsized(current_path.clone(), Query::default()),
-                    format!(
-                        "V1 trunk hash mismatch at layer {} from bottom: expected {}, got {}",
-                        i,
-                        hex::encode(layer_info.expected_hash),
-                        hex::encode(combined_hash)
-                    ),
-                )
-            })?;
-
-            current_lower_hash = layer_info.layer_root_hash;
-        }
+        check_trunk_chain_v1(&layer_infos, lower_hash, &current_path)?;
 
         // Handle empty tree early return (AFTER hash verification)
         if count == 0 {
@@ -5096,10 +5034,17 @@ impl GroveDb {
         // Non-empty tree: extract elements
         let target_tree = target_tree_opt.unwrap();
         let tree_depth = calculate_max_tree_depth_from_count(count);
-        let chunk_depths = calculate_chunk_depths(tree_depth, query.max_depth)
-            .map_err(|e| Error::CorruptedData(format!("invalid chunk depth parameters: {}", e)))?;
+        let chunk_depths = match calculate_chunk_depths(tree_depth, query.max_depth) {
+            Ok(chunk_depths) => chunk_depths,
+            Err(e) => {
+                return Err(Error::CorruptedData(format!(
+                    "invalid chunk depth parameters: {}",
+                    e
+                )));
+            }
+        };
 
-        let max_depth = chunk_depths.first().copied().unwrap_or(0) as usize;
+        let max_depth = first_chunk_depth(&chunk_depths);
         let mut elements = BTreeMap::new();
         let mut leaf_keys = BTreeMap::new();
         Self::extract_elements_and_leaf_keys(
@@ -5120,6 +5065,159 @@ impl GroveDb {
         };
 
         Ok((grovedb_root_hash, trunk_result))
+    }
+
+    /// One path segment of the V1 trunk walk (the body of its path loop):
+    /// require Merk bytes, prove `path_segment` in `layer`, then return the
+    /// layer's record, the count of the target element (meaningful only
+    /// when `is_last`), and the next layer. Errors in the order the loop
+    /// raised them.
+    fn trunk_path_layer_v1<'a>(
+        layer: &'a LayerProof,
+        path_segment: &Vec<u8>,
+        i: usize,
+        is_last: bool,
+        current_path: &[Vec<u8>],
+        grove_version: &GroveVersion,
+    ) -> Result<(TrunkLayerInfo, Option<u64>, &'a LayerProof), Error> {
+        let key_query = single_key_query(path_segment);
+
+        // Extract merk bytes from ProofBytes::Merk
+        let merk_proof_bytes = match &layer.merk_proof {
+            ProofBytes::Merk(bytes) => bytes,
+            _ => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query),
+                    "V1 trunk proof: expected Merk proof bytes at path layer".to_string(),
+                ));
+            }
+        };
+
+        let (layer_root_hash, result) = match key_query
+            .execute_proof(merk_proof_bytes, None, true, PROOF_VERSION_LATEST)
+            .unwrap()
+        {
+            Ok(executed) => executed,
+            Err(e) => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query.clone()),
+                    format!("Invalid V1 trunk proof at path layer {}: {}", i, e),
+                ));
+            }
+        };
+
+        let (found_value_bytes, found_hash, count) =
+            Self::trunk_segment_row(&result.result_set, path_segment, is_last, grove_version)?;
+
+        let value_bytes = match found_value_bytes {
+            Some(value_bytes) => value_bytes,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query.clone()),
+                    format!(
+                        "V1 trunk: path segment {} not found in proof result",
+                        hex::encode(path_segment)
+                    ),
+                ));
+            }
+        };
+
+        let expected_hash = match found_hash {
+            Some(expected_hash) => expected_hash,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query.clone()),
+                    format!(
+                        "V1 trunk: no hash found for path segment {}",
+                        hex::encode(path_segment)
+                    ),
+                ));
+            }
+        };
+
+        let lower_layer = match layer.lower_layers.get(path_segment) {
+            Some(lower_layer) => lower_layer,
+            None => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), key_query),
+                    format!(
+                        "V1 trunk: missing lower layer for path segment {}",
+                        hex::encode(path_segment)
+                    ),
+                ));
+            }
+        };
+
+        Ok((
+            TrunkLayerInfo {
+                value_bytes,
+                expected_hash,
+                layer_root_hash,
+            },
+            count,
+            lower_layer,
+        ))
+    }
+
+    /// The V1 trunk's target layer: for `count == 0` its bytes must be
+    /// empty and its hash is `NULL_HASH`; otherwise the ops are decoded
+    /// (all of them, no trailing bytes) and executed into the target tree,
+    /// whose hash is the lower hash of the chain.
+    fn trunk_target_v1(
+        target_merk_bytes: &[u8],
+        count: u64,
+        query: &PathTrunkChunkQuery,
+        current_path: &[Vec<u8>],
+    ) -> Result<(CryptoHash, Option<grovedb_merk::proofs::tree::Tree>), Error> {
+        if count == 0 {
+            if !target_merk_bytes.is_empty() {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), Query::default()),
+                    format!(
+                        "V1 trunk: target layer has {} bytes but count is 0 (expected empty)",
+                        target_merk_bytes.len()
+                    ),
+                ));
+            }
+            return Ok((NULL_HASH, None));
+        }
+        let tree_depth = calculate_max_tree_depth_from_count(count);
+        if let Err(e) = calculate_chunk_depths(tree_depth, query.max_depth) {
+            return Err(Error::CorruptedData(format!(
+                "invalid chunk depth parameters: {}",
+                e
+            )));
+        }
+
+        let mut decoder = Decoder::new(target_merk_bytes);
+        let ops = match decode_chunk_ops(&mut decoder) {
+            Ok(ops) => ops,
+            Err(e) => {
+                return Err(Error::CorruptedData(format!(
+                    "Failed to decode V1 trunk proof: {}",
+                    e
+                )));
+            }
+        };
+        if decoder.remaining_bytes() > 0 {
+            return Err(Error::CorruptedData(format!(
+                "V1 trunk proof has {} unconsumed trailing bytes",
+                decoder.remaining_bytes()
+            )));
+        }
+
+        let target_tree = match execute_chunk_ops(&ops).unwrap() {
+            Ok(target_tree) => target_tree,
+            Err(e) => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.to_vec(), Query::default()),
+                    format!("Failed to execute V1 trunk proof: {}", e),
+                ));
+            }
+        };
+
+        let hash = target_tree.hash().unwrap();
+        Ok((hash, Some(target_tree)))
     }
 
     /// Recursively extract elements and leaf keys from a proof tree.
@@ -5379,6 +5477,33 @@ impl GroveDb {
     }
 }
 
+/// One path layer a trunk proof walked: the element bytes and value hash the
+/// layer proved for the path segment, and the layer's own Merk root (the
+/// child hash its parent layer commits to).
+struct TrunkLayerInfo {
+    value_bytes: Vec<u8>,
+    expected_hash: CryptoHash,
+    /// The root hash of this layer's merk tree (used as child hash for
+    /// parent layer)
+    layer_root_hash: CryptoHash,
+}
+
+/// The single-key query a trunk walk proves each path segment with:
+/// `Query { items: vec![Key(path_segment)], ..Default::default() }`, with
+/// the one-item list built by `push` (the extraction does not translate
+/// that `vec![..]`).
+#[allow(clippy::vec_init_then_push)]
+fn single_key_query(path_segment: &[u8]) -> Query {
+    let mut items = Vec::with_capacity(1);
+    items.push(grovedb_merk::proofs::query::QueryItem::Key(
+        path_segment.to_vec(),
+    ));
+    Query {
+        items,
+        ..Default::default()
+    }
+}
+
 /// Every op of a chunk proof, decoded in order, stopping at the first
 /// decoding error: `decoder.by_ref().collect::<Result<Vec<Op>, _>>()` as a
 /// loop (the extraction has no model of `collect`). The decoder is left
@@ -5443,6 +5568,125 @@ fn execute_chunk_ops(
 ) -> grovedb_costs::CostResult<grovedb_merk::proofs::tree::Tree, grovedb_merk::Error> {
     let mut cloned = ClonedChunkOps { ops, next: 0 };
     grovedb_merk::proofs::tree::execute_with_visitor(&mut cloned, false, true, &mut AcceptEveryNode)
+}
+
+/// The V0 trunk's hash chain, from the target layer up: for each layer,
+/// innermost first, `combine_hash(H(value), lower) == expected`, and the
+/// layer's own root becomes the next `lower`. Stops at the first mismatch;
+/// `j` in the message counts layers from the bottom.
+fn check_trunk_chain_v0(
+    layer_infos: &[TrunkLayerInfo],
+    lower_hash: CryptoHash,
+    current_path: &[Vec<u8>],
+) -> Result<(), Error> {
+    let n = layer_infos.len();
+    let mut lower_hash = lower_hash;
+    let mut failure = None;
+    let mut failed = false;
+    let mut j = 0;
+    while j < n && !failed {
+        let layer_info = &layer_infos[n - 1 - j];
+        match trunk_link_v0(layer_info, &lower_hash, j, current_path) {
+            Ok(()) => lower_hash = layer_info.layer_root_hash,
+            Err(e) => {
+                failure = Some(e);
+                failed = true;
+            }
+        }
+        j += 1;
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// One link of [`check_trunk_chain_v0`].
+fn trunk_link_v0(
+    layer_info: &TrunkLayerInfo,
+    lower_hash: &CryptoHash,
+    i: usize,
+    current_path: &[Vec<u8>],
+) -> Result<(), Error> {
+    let combined_hash = combine_hash(value_hash(&layer_info.value_bytes).value(), lower_hash)
+        .value()
+        .to_owned();
+
+    if combined_hash != layer_info.expected_hash {
+        return Err(Error::InvalidProof(
+            PathQuery::new_unsized(current_path.to_vec(), Query::default()),
+            format!(
+                "Hash mismatch at layer {} from bottom: expected {}, got {}",
+                i,
+                hex::encode(layer_info.expected_hash),
+                hex::encode(combined_hash)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The V1 trunk's hash chain, as [`check_trunk_chain_v0`] but checking
+/// each link through [`ParentCommitment`] with the V1 message.
+fn check_trunk_chain_v1(
+    layer_infos: &[TrunkLayerInfo],
+    lower_hash: CryptoHash,
+    current_path: &[Vec<u8>],
+) -> Result<(), Error> {
+    let n = layer_infos.len();
+    let mut current_lower_hash = lower_hash;
+    let mut failure = None;
+    let mut failed = false;
+    let mut j = 0;
+    while j < n && !failed {
+        let layer_info = &layer_infos[n - 1 - j];
+        match trunk_link_v1(layer_info, &current_lower_hash, j, current_path) {
+            Ok(()) => current_lower_hash = layer_info.layer_root_hash,
+            Err(e) => {
+                failure = Some(e);
+                failed = true;
+            }
+        }
+        j += 1;
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// One link of [`check_trunk_chain_v1`].
+fn trunk_link_v1(
+    layer_info: &TrunkLayerInfo,
+    current_lower_hash: &CryptoHash,
+    i: usize,
+    current_path: &[Vec<u8>],
+) -> Result<(), Error> {
+    let parent = ParentCommitment {
+        value_bytes: &layer_info.value_bytes,
+        value_hash: &layer_info.expected_hash,
+    };
+    match parent.check(current_lower_hash) {
+        Ok(()) => Ok(()),
+        Err(combined_hash) => Err(Error::InvalidProof(
+            PathQuery::new_unsized(current_path.to_vec(), Query::default()),
+            format!(
+                "V1 trunk hash mismatch at layer {} from bottom: expected {}, got {}",
+                i,
+                hex::encode(layer_info.expected_hash),
+                hex::encode(combined_hash)
+            ),
+        )),
+    }
+}
+
+/// The trunk's extraction depth: the first chunk depth, or 0 if there is
+/// none (`chunk_depths.first().copied().unwrap_or(0) as usize`).
+fn first_chunk_depth(chunk_depths: &[u8]) -> usize {
+    match chunk_depths.first() {
+        Some(depth) => *depth as usize,
+        None => 0,
+    }
 }
 
 /// Whether a chunk-proof child is a `Node::Hash`, `None` without a child
@@ -5606,6 +5850,966 @@ fn be_u64(bytes: &[u8]) -> Option<u64> {
     Some(value)
 }
 
+/// The trunk and branch chunk verifiers were reshaped for the Rust-to-Lean
+/// extraction. The `ref_` functions are the previous bodies of
+/// `verify_trunk_chunk_proof_v0` / `_v1`, `extract_elements_and_leaf_keys`
+/// and `verify_branch_chunk_proof`, verbatim except for their names and
+/// `GroveDb::` for `Self::`. The tests compare `Debug` output of the old and
+/// new verifiers on real proofs (V0 and V1 envelopes) and on mutations of
+/// every layer of them.
+#[cfg(all(test, feature = "minimal"))]
+mod chunk_proof_reference_tests {
+    use grovedb_merk::proofs::execute;
+    use grovedb_version::version::v1::GROVE_V1;
+
+    use super::{chunk_decode_reference_tests::mutations, *};
+    use crate::{
+        query::PathBranchChunkQuery,
+        tests::{common::EMPTY_PATH, make_empty_grovedb},
+    };
+
+    fn ref_verify_trunk_chunk_proof_v0(
+        proof: &GroveDBProofV0,
+        query: &PathTrunkChunkQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
+        // Collect layer info as we walk down the path for later verification
+        struct LayerInfo {
+            value_bytes: Vec<u8>,
+            expected_hash: CryptoHash,
+            /// The root hash of this layer's merk tree (used as child hash for
+            /// parent layer)
+            layer_root_hash: CryptoHash,
+        }
+        let mut layer_infos: Vec<LayerInfo> = Vec::new();
+
+        let mut current_layer = &proof.root_layer;
+        let mut current_path: Vec<Vec<u8>> = Vec::new();
+        let mut count: Option<u64> = None;
+        let mut grovedb_root_hash: Option<CryptoHash> = None;
+
+        // Walk through each path segment, verifying layer proofs
+        for (i, path_segment) in query.path.iter().enumerate() {
+            // Create a simple key query for this path segment
+            let key_query = Query {
+                items: vec![grovedb_merk::proofs::query::QueryItem::Key(
+                    path_segment.clone(),
+                )],
+                ..Default::default()
+            };
+
+            // Execute the proof to verify and get the root hash
+            let (layer_root_hash, result) = key_query
+                .execute_proof(
+                    &current_layer.merk_proof,
+                    None,
+                    true,
+                    0, // V0 proof: allow items in value hash nodes
+                )
+                .unwrap()
+                .map_err(|e| {
+                    Error::InvalidProof(
+                        PathQuery::new_unsized(current_path.clone(), key_query.clone()),
+                        format!("Invalid proof at path layer {}: {}", i, e),
+                    )
+                })?;
+
+            // Store the root hash of the first layer as the GroveDB root hash
+            if i == 0 {
+                grovedb_root_hash = Some(layer_root_hash);
+            }
+
+            // Find the element for this key in the result set
+            let mut found_value_bytes: Option<Vec<u8>> = None;
+            let mut found_hash: Option<CryptoHash> = None;
+
+            for proved_key_value in &result.result_set {
+                if proved_key_value.key == *path_segment {
+                    found_hash = Some(proved_key_value.proof);
+                    if let Some(value_bytes) = &proved_key_value.value {
+                        found_value_bytes = Some(value_bytes.clone());
+
+                        // On the last path segment, extract the count from the CountTree element
+                        if i == query.path.len() - 1 {
+                            let element = Element::deserialize(value_bytes, grove_version)?;
+                            count = GroveDb::extract_count_from_element(&element);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            let value_bytes = found_value_bytes.ok_or_else(|| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
+                    format!(
+                        "Path segment {} not found in proof result",
+                        hex::encode(path_segment)
+                    ),
+                )
+            })?;
+
+            let expected_hash = found_hash.ok_or_else(|| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
+                    format!(
+                        "No hash found for path segment {}",
+                        hex::encode(path_segment)
+                    ),
+                )
+            })?;
+
+            // Store layer info for later verification
+            layer_infos.push(LayerInfo {
+                value_bytes,
+                expected_hash,
+                layer_root_hash,
+            });
+
+            // Move to the next layer
+            current_layer = current_layer
+                .lower_layers
+                .get(path_segment)
+                .ok_or_else(|| {
+                    Error::InvalidProof(
+                        PathQuery::new_unsized(current_path.clone(), key_query),
+                        format!(
+                            "Missing lower layer for path segment {}",
+                            hex::encode(path_segment)
+                        ),
+                    )
+                })?;
+
+            current_path.push(path_segment.clone());
+        }
+
+        // Ensure we got a count from the element
+        let count = count.ok_or_else(|| {
+            Error::InvalidProof(
+                PathQuery::new_unsized(current_path.clone(), Query::default()),
+                "Could not extract count from path - target is not a count tree element"
+                    .to_string(),
+            )
+        })?;
+
+        // Empty tree — return an empty result.
+        // The parent layers' merk proofs already verified the hash chain integrity,
+        // including the element's value_hash. The count is authenticated by the
+        // parent proof. With count==0 there is no child data to verify against.
+        if count == 0 {
+            let grovedb_root_hash = grovedb_root_hash.ok_or_else(|| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(Vec::new(), Query::default()),
+                    "Empty path - no root hash computed".to_string(),
+                )
+            })?;
+
+            return Ok((
+                grovedb_root_hash,
+                GroveTrunkQueryResult {
+                    elements: BTreeMap::new(),
+                    leaf_keys: BTreeMap::new(),
+                    chunk_depths: vec![],
+                    max_tree_depth: 0,
+                    tree: grovedb_merk::proofs::tree::Tree::from(Node::Hash(NULL_HASH)),
+                },
+            ));
+        }
+
+        let tree_depth = calculate_max_tree_depth_from_count(count);
+        let chunk_depths = calculate_chunk_depths(tree_depth, query.max_depth)
+            .map_err(|e| Error::CorruptedData(format!("invalid chunk depth parameters: {}", e)))?;
+
+        // Now we're at the target layer - decode and execute the trunk proof
+        let mut decoder = Decoder::new(&current_layer.merk_proof);
+        let ops: Vec<Op> = decoder
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::CorruptedData(format!("Failed to decode trunk proof: {}", e)))?;
+        if decoder.remaining_bytes() > 0 {
+            return Err(Error::CorruptedData(format!(
+                "Trunk proof has {} unconsumed trailing bytes",
+                decoder.remaining_bytes()
+            )));
+        }
+
+        // Execute the proof to build the tree structure and get its root hash
+        // Use collapse=false to preserve the full tree structure for element extraction
+        let target_tree = execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))
+            .unwrap()
+            .map_err(|e| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    format!("Failed to execute trunk proof: {}", e),
+                )
+            })?;
+
+        let mut lower_hash = target_tree.hash().unwrap();
+
+        // Verify the cryptographic chain from trunk up through all layers
+        // Walk backwards through the layer infos, verifying each step
+        for (i, layer_info) in layer_infos.iter().rev().enumerate() {
+            let combined_hash =
+                combine_hash(value_hash(&layer_info.value_bytes).value(), &lower_hash)
+                    .value()
+                    .to_owned();
+
+            if combined_hash != layer_info.expected_hash {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    format!(
+                        "Hash mismatch at layer {} from bottom: expected {}, got {}",
+                        i,
+                        hex::encode(layer_info.expected_hash),
+                        hex::encode(combined_hash)
+                    ),
+                ));
+            }
+
+            // For the next iteration, use this layer's merk tree root hash.
+            // This is what the parent layer uses as the child hash for this subtree.
+            lower_hash = layer_info.layer_root_hash;
+        }
+
+        // Extract elements and leaf keys from the proof tree
+        // The max depth for the trunk is the first chunk depth
+        let max_depth = chunk_depths.first().copied().unwrap_or(0) as usize;
+        let mut elements = BTreeMap::new();
+        let mut leaf_keys = BTreeMap::new();
+        ref_extract_elements_and_leaf_keys(
+            &target_tree,
+            &mut elements,
+            &mut leaf_keys,
+            0,
+            max_depth,
+            grove_version,
+        )?;
+
+        let grovedb_root_hash = grovedb_root_hash.ok_or_else(|| {
+            Error::InvalidProof(
+                PathQuery::new_unsized(Vec::new(), Query::default()),
+                "Empty path - no root hash computed".to_string(),
+            )
+        })?;
+
+        let trunk_result = GroveTrunkQueryResult {
+            elements,
+            leaf_keys,
+            chunk_depths,
+            max_tree_depth: tree_depth,
+            tree: target_tree,
+        };
+
+        Ok((grovedb_root_hash, trunk_result))
+    }
+
+    fn ref_verify_trunk_chunk_proof_v1(
+        proof: &GroveDBProofV1,
+        query: &PathTrunkChunkQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
+        if query.path.is_empty() {
+            return Err(Error::InvalidProof(
+                PathQuery::new_unsized(Vec::new(), Query::default()),
+                "V1 trunk: empty path - no root hash computed".to_string(),
+            ));
+        }
+
+        // Collect layer info as we walk down the path for later verification
+        struct LayerInfo {
+            value_bytes: Vec<u8>,
+            expected_hash: CryptoHash,
+            /// The root hash of this layer's merk tree
+            layer_root_hash: CryptoHash,
+        }
+        let mut layer_infos: Vec<LayerInfo> = Vec::new();
+
+        let mut current_layer = &proof.root_layer;
+        let mut current_path: Vec<Vec<u8>> = Vec::new();
+        let mut count: Option<u64> = None;
+        let mut grovedb_root_hash: CryptoHash = [0u8; 32];
+
+        // Walk through each path segment, verifying layer proofs
+        for (i, path_segment) in query.path.iter().enumerate() {
+            let key_query = Query {
+                items: vec![grovedb_merk::proofs::query::QueryItem::Key(
+                    path_segment.clone(),
+                )],
+                ..Default::default()
+            };
+
+            // Extract merk bytes from ProofBytes::Merk
+            let merk_proof_bytes = match &current_layer.merk_proof {
+                ProofBytes::Merk(bytes) => bytes,
+                _ => {
+                    return Err(Error::InvalidProof(
+                        PathQuery::new_unsized(current_path.clone(), key_query),
+                        "V1 trunk proof: expected Merk proof bytes at path layer".to_string(),
+                    ));
+                }
+            };
+
+            let (layer_root_hash, result) = key_query
+                .execute_proof(merk_proof_bytes, None, true, PROOF_VERSION_LATEST)
+                .unwrap()
+                .map_err(|e| {
+                    Error::InvalidProof(
+                        PathQuery::new_unsized(current_path.clone(), key_query.clone()),
+                        format!("Invalid V1 trunk proof at path layer {}: {}", i, e),
+                    )
+                })?;
+
+            if i == 0 {
+                grovedb_root_hash = layer_root_hash;
+            }
+
+            let mut found_value_bytes: Option<Vec<u8>> = None;
+            let mut found_hash: Option<CryptoHash> = None;
+
+            for proved_key_value in &result.result_set {
+                if proved_key_value.key == *path_segment {
+                    found_hash = Some(proved_key_value.proof);
+                    if let Some(value_bytes) = &proved_key_value.value {
+                        found_value_bytes = Some(value_bytes.clone());
+
+                        if i == query.path.len() - 1 {
+                            let element = Element::deserialize(value_bytes, grove_version)?;
+                            count = GroveDb::extract_count_from_element(&element);
+                        }
+                    }
+                    break;
+                }
+            }
+
+            let value_bytes = found_value_bytes.ok_or_else(|| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
+                    format!(
+                        "V1 trunk: path segment {} not found in proof result",
+                        hex::encode(path_segment)
+                    ),
+                )
+            })?;
+
+            let expected_hash = found_hash.ok_or_else(|| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), key_query.clone()),
+                    format!(
+                        "V1 trunk: no hash found for path segment {}",
+                        hex::encode(path_segment)
+                    ),
+                )
+            })?;
+
+            layer_infos.push(LayerInfo {
+                value_bytes,
+                expected_hash,
+                layer_root_hash,
+            });
+
+            current_layer = current_layer
+                .lower_layers
+                .get(path_segment)
+                .ok_or_else(|| {
+                    Error::InvalidProof(
+                        PathQuery::new_unsized(current_path.clone(), key_query),
+                        format!(
+                            "V1 trunk: missing lower layer for path segment {}",
+                            hex::encode(path_segment)
+                        ),
+                    )
+                })?;
+
+            current_path.push(path_segment.clone());
+        }
+
+        let count = count.ok_or_else(|| {
+            Error::InvalidProof(
+                PathQuery::new_unsized(current_path.clone(), Query::default()),
+                "V1 trunk: could not extract count from path - target is not a count tree element"
+                    .to_string(),
+            )
+        })?;
+
+        // Extract merk bytes from the target layer
+        let target_merk_bytes = match &current_layer.merk_proof {
+            ProofBytes::Merk(bytes) => bytes,
+            _ => {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    "V1 trunk proof: expected Merk proof bytes at target layer".to_string(),
+                ));
+            }
+        };
+
+        // Determine the lower hash -- always computed, even for empty trees.
+        // This is the critical security fix: V0 skipped this for count==0.
+        let (lower_hash, target_tree_opt) = if count == 0 {
+            if !target_merk_bytes.is_empty() {
+                return Err(Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    format!(
+                        "V1 trunk: target layer has {} bytes but count is 0 (expected empty)",
+                        target_merk_bytes.len()
+                    ),
+                ));
+            }
+            (NULL_HASH, None)
+        } else {
+            let tree_depth = calculate_max_tree_depth_from_count(count);
+            let _chunk_depths =
+                calculate_chunk_depths(tree_depth, query.max_depth).map_err(|e| {
+                    Error::CorruptedData(format!("invalid chunk depth parameters: {}", e))
+                })?;
+
+            let mut decoder = Decoder::new(target_merk_bytes);
+            let ops: Vec<Op> = decoder
+                .by_ref()
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    Error::CorruptedData(format!("Failed to decode V1 trunk proof: {}", e))
+                })?;
+            if decoder.remaining_bytes() > 0 {
+                return Err(Error::CorruptedData(format!(
+                    "V1 trunk proof has {} unconsumed trailing bytes",
+                    decoder.remaining_bytes()
+                )));
+            }
+
+            let target_tree = execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))
+                .unwrap()
+                .map_err(|e| {
+                    Error::InvalidProof(
+                        PathQuery::new_unsized(current_path.clone(), Query::default()),
+                        format!("Failed to execute V1 trunk proof: {}", e),
+                    )
+                })?;
+
+            let hash = target_tree.hash().unwrap();
+            (hash, Some(target_tree))
+        };
+
+        // ALWAYS verify the cryptographic chain from trunk up through all layers.
+        // This is the security fix: V0 skipped this when count==0, allowing
+        // an attacker to forge the element bytes while keeping the original
+        // value_hash in a KVValueHash node.
+        let mut current_lower_hash = lower_hash;
+        for (i, layer_info) in layer_infos.iter().rev().enumerate() {
+            let parent = ParentCommitment {
+                value_bytes: &layer_info.value_bytes,
+                value_hash: &layer_info.expected_hash,
+            };
+            parent.check(&current_lower_hash).map_err(|combined_hash| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(current_path.clone(), Query::default()),
+                    format!(
+                        "V1 trunk hash mismatch at layer {} from bottom: expected {}, got {}",
+                        i,
+                        hex::encode(layer_info.expected_hash),
+                        hex::encode(combined_hash)
+                    ),
+                )
+            })?;
+
+            current_lower_hash = layer_info.layer_root_hash;
+        }
+
+        // Handle empty tree early return (AFTER hash verification)
+        if count == 0 {
+            return Ok((
+                grovedb_root_hash,
+                GroveTrunkQueryResult {
+                    elements: BTreeMap::new(),
+                    leaf_keys: BTreeMap::new(),
+                    chunk_depths: vec![],
+                    max_tree_depth: 0,
+                    tree: grovedb_merk::proofs::tree::Tree::from(Node::Hash(NULL_HASH)),
+                },
+            ));
+        }
+
+        // Non-empty tree: extract elements
+        let target_tree = target_tree_opt.unwrap();
+        let tree_depth = calculate_max_tree_depth_from_count(count);
+        let chunk_depths = calculate_chunk_depths(tree_depth, query.max_depth)
+            .map_err(|e| Error::CorruptedData(format!("invalid chunk depth parameters: {}", e)))?;
+
+        let max_depth = chunk_depths.first().copied().unwrap_or(0) as usize;
+        let mut elements = BTreeMap::new();
+        let mut leaf_keys = BTreeMap::new();
+        ref_extract_elements_and_leaf_keys(
+            &target_tree,
+            &mut elements,
+            &mut leaf_keys,
+            0,
+            max_depth,
+            grove_version,
+        )?;
+
+        let trunk_result = GroveTrunkQueryResult {
+            elements,
+            leaf_keys,
+            chunk_depths,
+            max_tree_depth: tree_depth,
+            tree: target_tree,
+        };
+
+        Ok((grovedb_root_hash, trunk_result))
+    }
+
+    fn ref_extract_elements_and_leaf_keys(
+        tree: &grovedb_merk::proofs::tree::Tree,
+        elements: &mut BTreeMap<Vec<u8>, Element>,
+        leaf_keys: &mut BTreeMap<Vec<u8>, crate::query::LeafInfo>,
+        current_depth: usize,
+        max_depth: usize,
+        grove_version: &GroveVersion,
+    ) -> Result<(), Error> {
+        // Check that we haven't exceeded the max depth
+        if current_depth > max_depth {
+            return Err(Error::InvalidProof(
+                PathQuery::new_unsized(Vec::new(), Query::default()),
+                format!(
+                    "Trunk proof exceeds max depth: current depth {} > max depth {}",
+                    current_depth, max_depth
+                ),
+            ));
+        }
+
+        // Check for inconsistent depth: if one child is Hash and the other exists
+        // but is not Hash, the proof has inconsistent truncation depth
+        let left_is_hash = tree
+            .left
+            .as_ref()
+            .map(|c| matches!(c.tree.node, Node::Hash(_)));
+        let right_is_hash = tree
+            .right
+            .as_ref()
+            .map(|c| matches!(c.tree.node, Node::Hash(_)));
+
+        // If both children exist, they must both be Hash or both be non-Hash
+        if let (Some(left_hash), Some(right_hash)) = (left_is_hash, right_is_hash)
+            && left_hash != right_hash
+        {
+            return Err(Error::InvalidProof(
+                PathQuery::new_unsized(Vec::new(), Query::default()),
+                "Inconsistent trunk proof depth: one child is Hash while the other is not"
+                    .to_string(),
+            ));
+        }
+
+        // Extract key and value from this node - must exist for valid trunk proofs
+        let (key, value) = GroveDb::get_key_value_from_node(&tree.node).ok_or_else(|| {
+            Error::InvalidProof(
+                PathQuery::new_unsized(Vec::new(), Query::default()),
+                format!(
+                    "Trunk proof contains node without key/value data: {:?}",
+                    tree.node
+                ),
+            )
+        })?;
+
+        let element = Element::deserialize(&value, grove_version)?;
+
+        // A row only reaches here under a genuine root hash, but the merk
+        // root covers a tree's or reference's `value_hash`, not its bytes:
+        // whether the node form binds them is version-gated (#859).
+        GroveDb::check_chunk_proof_row(&tree.node, &key, &value, &element, grove_version)?;
+
+        elements.insert(key.clone(), element);
+
+        // Check if this node has Hash children (making it a leaf)
+        let has_hash_child = left_is_hash.unwrap_or(false) || right_is_hash.unwrap_or(false);
+
+        if has_hash_child {
+            // Store the node's hash and count as LeafInfo for branch queries.
+            // When a branch query is made for this key, the branch proof's root hash
+            // should match this node's hash.
+            let node_hash = tree.hash().unwrap();
+
+            // Extract count from TreeFeatureType if available
+            // Note: KVHashCount is not included as it never reaches this code path
+            let count = match &tree.node {
+                Node::KVValueHashFeatureType(_, _, _, feature_type)
+                | Node::KVValueHashFeatureTypeWithChildHash(_, _, _, feature_type, _) => {
+                    feature_type.count()
+                }
+                Node::KVCount(_, _, count) => Some(*count),
+                Node::KVRefValueHashCount(_, _, _, count) => Some(*count),
+                // Dual-axis (PCPS) variants — count lives at the same
+                // position as the single-axis count.
+                Node::KVCountSum(_, _, count, _) => Some(*count),
+                _ => None,
+            };
+
+            leaf_keys.insert(
+                key,
+                crate::query::LeafInfo {
+                    hash: node_hash,
+                    count,
+                },
+            );
+        }
+
+        // Recurse into non-Hash children
+        if let Some(left) = &tree.left
+            && !matches!(left.tree.node, Node::Hash(_))
+        {
+            ref_extract_elements_and_leaf_keys(
+                &left.tree,
+                elements,
+                leaf_keys,
+                current_depth + 1,
+                max_depth,
+                grove_version,
+            )?;
+        }
+        if let Some(right) = &tree.right
+            && !matches!(right.tree.node, Node::Hash(_))
+        {
+            ref_extract_elements_and_leaf_keys(
+                &right.tree,
+                elements,
+                leaf_keys,
+                current_depth + 1,
+                max_depth,
+                grove_version,
+            )?;
+        }
+
+        Ok(())
+    }
+
+    fn ref_verify_branch_chunk_proof(
+        proof: &[u8],
+        query: &crate::query::PathBranchChunkQuery,
+        expected_root_hash: CryptoHash,
+        grove_version: &GroveVersion,
+    ) -> Result<crate::query::GroveBranchQueryResult, Error> {
+        // Decode the proof ops
+        let mut decoder = Decoder::new(proof);
+        let ops: Vec<Op> = decoder
+            .by_ref()
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::CorruptedData(format!("Failed to decode branch proof: {}", e)))?;
+        if decoder.remaining_bytes() > 0 {
+            return Err(Error::CorruptedData(format!(
+                "Branch proof has {} unconsumed trailing bytes",
+                decoder.remaining_bytes()
+            )));
+        }
+
+        // Execute the proof to build the tree structure and get its root hash
+        // Use collapse=false to preserve the full tree structure for element extraction
+        let branch_tree = execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))
+            .unwrap()
+            .map_err(|e| {
+                Error::InvalidProof(
+                    PathQuery::new_unsized(query.path.clone(), Query::default()),
+                    format!("Failed to execute branch proof: {}", e),
+                )
+            })?;
+
+        let branch_root_hash = branch_tree.hash().unwrap();
+
+        // Verify the computed hash matches the expected hash from the parent proof
+        if branch_root_hash != expected_root_hash {
+            return Err(Error::InvalidProof(
+                PathQuery::new_unsized(query.path.clone(), Query::default()),
+                format!(
+                    "Branch root hash mismatch: expected {}, got {}",
+                    hex::encode(expected_root_hash),
+                    hex::encode(branch_root_hash)
+                ),
+            ));
+        }
+
+        // Extract elements and leaf keys from the proof tree
+        let mut elements = BTreeMap::new();
+        let mut leaf_keys = BTreeMap::new();
+        ref_extract_elements_and_leaf_keys(
+            &branch_tree,
+            &mut elements,
+            &mut leaf_keys,
+            0,
+            query.depth as usize,
+            grove_version,
+        )?;
+
+        Ok(crate::query::GroveBranchQueryResult {
+            elements,
+            leaf_keys,
+            branch_root_hash,
+            tree: branch_tree,
+        })
+    }
+
+    fn ref_verify_trunk_chunk_proof(
+        proof: &[u8],
+        query: &PathTrunkChunkQuery,
+        grove_version: &GroveVersion,
+    ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
+        let grovedb_proof = super::super::decode_grovedb_proof_canonical(proof)?;
+        match grovedb_proof {
+            GroveDBProof::V0(proof_v0) => {
+                ref_verify_trunk_chunk_proof_v0(&proof_v0, query, grove_version)
+            }
+            GroveDBProof::V1(proof_v1) => {
+                ref_verify_trunk_chunk_proof_v1(&proof_v1, query, grove_version)
+            }
+        }
+    }
+
+    fn config() -> impl bincode::config::Config {
+        bincode::config::standard()
+            .with_big_endian()
+            .with_no_limit()
+    }
+
+    fn compare_trunk(proof: &[u8], query: &PathTrunkChunkQuery, grove_version: &GroveVersion) {
+        let got = GroveDb::verify_trunk_chunk_proof(proof, query, grove_version);
+        let want = ref_verify_trunk_chunk_proof(proof, query, grove_version);
+        assert_eq!(format!("{got:?}"), format!("{want:?}"), "{query:?}");
+    }
+
+    fn v1_layer_at_mut<'a>(
+        layer: &'a mut LayerProof,
+        path: &[Vec<u8>],
+    ) -> Option<&'a mut LayerProof> {
+        match path.split_first() {
+            None => Some(layer),
+            Some((first, rest)) => match layer.lower_layers.get_mut(first) {
+                Some(lower) => v1_layer_at_mut(lower, rest),
+                None => None,
+            },
+        }
+    }
+
+    fn v0_layer_at_mut<'a>(
+        layer: &'a mut MerkOnlyLayerProof,
+        path: &[Vec<u8>],
+    ) -> Option<&'a mut MerkOnlyLayerProof> {
+        match path.split_first() {
+            None => Some(layer),
+            Some((first, rest)) => match layer.lower_layers.get_mut(first) {
+                Some(lower) => v0_layer_at_mut(lower, rest),
+                None => None,
+            },
+        }
+    }
+
+    fn to_merk_only(layer: &LayerProof) -> MerkOnlyLayerProof {
+        let merk_proof = match &layer.merk_proof {
+            ProofBytes::Merk(bytes) => bytes.clone(),
+            _ => Vec::new(),
+        };
+        let mut lower_layers = BTreeMap::new();
+        for (k, v) in &layer.lower_layers {
+            lower_layers.insert(k.clone(), to_merk_only(v));
+        }
+        MerkOnlyLayerProof {
+            merk_proof,
+            lower_layers,
+        }
+    }
+
+    fn decode(proof: &[u8]) -> GroveDBProof {
+        bincode::decode_from_slice(proof, config()).unwrap().0
+    }
+
+    /// The merk bytes of the layer at `prefix`, if the proof has one.
+    fn layer_bytes(proof: &[u8], prefix: &[Vec<u8>]) -> Option<Vec<u8>> {
+        match decode(proof) {
+            GroveDBProof::V1(mut v1) => match v1_layer_at_mut(&mut v1.root_layer, prefix) {
+                Some(layer) => match &layer.merk_proof {
+                    ProofBytes::Merk(bytes) => Some(bytes.clone()),
+                    _ => None,
+                },
+                None => None,
+            },
+            GroveDBProof::V0(mut v0) => {
+                v0_layer_at_mut(&mut v0.root_layer, prefix).map(|layer| layer.merk_proof.clone())
+            }
+        }
+    }
+
+    /// `proof` with the layer at `prefix` edited: its merk bytes replaced
+    /// (`Some`), or its lower layers dropped (`None`). `as_mmr` swaps a V1
+    /// layer's bytes to a non-Merk variant instead.
+    fn edited(proof: &[u8], prefix: &[Vec<u8>], bytes: Option<Vec<u8>>, as_mmr: bool) -> Vec<u8> {
+        let mut decoded = decode(proof);
+        match &mut decoded {
+            GroveDBProof::V1(v1) => {
+                let layer = v1_layer_at_mut(&mut v1.root_layer, prefix).unwrap();
+                match bytes {
+                    Some(b) if as_mmr => layer.merk_proof = ProofBytes::MMR(b),
+                    Some(b) => layer.merk_proof = ProofBytes::Merk(b),
+                    None => layer.lower_layers.clear(),
+                }
+            }
+            GroveDBProof::V0(v0) => {
+                let layer = v0_layer_at_mut(&mut v0.root_layer, prefix).unwrap();
+                match bytes {
+                    Some(b) => layer.merk_proof = b,
+                    None => layer.lower_layers.clear(),
+                }
+            }
+        }
+        bincode::encode_to_vec(&decoded, config()).unwrap()
+    }
+
+    /// `proof` as a V0 envelope, if it is V1.
+    fn as_v0(proof: &[u8]) -> Option<Vec<u8>> {
+        match decode(proof) {
+            GroveDBProof::V1(v1) => {
+                let v0 = GroveDBProof::V0(GroveDBProofV0 {
+                    root_layer: to_merk_only(&v1.root_layer),
+                    prove_options: ProveOptions::default(),
+                });
+                Some(bincode::encode_to_vec(&v0, config()).unwrap())
+            }
+            GroveDBProof::V0(_) => None,
+        }
+    }
+
+    /// The verifier's view of `proof` and of every mutation of each layer
+    /// along `query.path` (and the target), plus a dropped lower layer, a
+    /// non-Merk layer, and the V0 conversion of each V1 variant.
+    fn compare_trunk_family(
+        proof: &[u8],
+        query: &PathTrunkChunkQuery,
+        grove_version: &GroveVersion,
+    ) {
+        let mut variants = vec![proof.to_vec()];
+        for depth in 0..=query.path.len() {
+            let prefix = &query.path[..depth];
+            let Some(bytes) = layer_bytes(proof, prefix) else {
+                continue;
+            };
+            for m in mutations(&bytes) {
+                variants.push(edited(proof, prefix, Some(m), false));
+            }
+            variants.push(edited(proof, prefix, Some(bytes.clone()), true));
+            variants.push(edited(proof, prefix, None, false));
+        }
+        let converted: Vec<Vec<u8>> = variants.iter().filter_map(|v| as_v0(v)).collect();
+        variants.extend(converted);
+        for v in variants {
+            compare_trunk(&v, query, grove_version);
+        }
+    }
+
+    /// Count trees of several sizes and kinds under one- and two-segment
+    /// paths, proved at V1 (latest) and V0 (GROVE_V1) prover versions.
+    #[test]
+    fn trunk_and_branch_verifiers_match_reference() {
+        let latest = GroveVersion::latest();
+        let db = make_empty_grovedb();
+        db.insert(
+            EMPTY_PATH,
+            b"root",
+            Element::empty_tree(),
+            None,
+            None,
+            latest,
+        )
+        .unwrap()
+        .unwrap();
+        let trees: [(&[u8], Element, u32); 5] = [
+            (b"c0", Element::empty_count_tree(), 0),
+            (b"c1", Element::empty_count_tree(), 1),
+            (b"c7", Element::empty_provable_count_tree(), 7),
+            (b"cs", Element::empty_count_sum_tree(), 40),
+            (b"it", Element::empty_tree(), 3),
+        ];
+        let mut queries = Vec::new();
+        for (key, element, n) in trees {
+            for parent in [vec![], vec![b"root".to_vec()]] {
+                let parent_refs: Vec<&[u8]> = parent.iter().map(|p| p.as_slice()).collect();
+                db.insert(
+                    parent_refs.as_slice(),
+                    key,
+                    element.clone(),
+                    None,
+                    None,
+                    latest,
+                )
+                .unwrap()
+                .unwrap();
+                let mut path = parent.clone();
+                path.push(key.to_vec());
+                let path_refs: Vec<&[u8]> = path.iter().map(|p| p.as_slice()).collect();
+                for i in 0..n {
+                    db.insert(
+                        path_refs.as_slice(),
+                        &i.to_be_bytes(),
+                        if key == b"cs" {
+                            Element::new_sum_item(i as i64 + 1)
+                        } else {
+                            Element::new_item(i.to_be_bytes().to_vec())
+                        },
+                        None,
+                        None,
+                        latest,
+                    )
+                    .unwrap()
+                    .unwrap();
+                }
+                for max_depth in [2u8, 3, 8] {
+                    queries.push(PathTrunkChunkQuery::new(path.clone(), max_depth));
+                }
+            }
+        }
+        let mut branch_cases = 0;
+        for query in &queries {
+            for grove_version in [latest, &GROVE_V1] {
+                let Ok(proof) = db.prove_trunk_chunk(query, grove_version).unwrap() else {
+                    continue;
+                };
+                compare_trunk_family(&proof, query, latest);
+                // Branches off the trunk's leaf keys, with the right and a
+                // wrong expected hash, and mutated proofs.
+                let Ok((_, trunk)) = GroveDb::verify_trunk_chunk_proof(&proof, query, latest)
+                else {
+                    continue;
+                };
+                for (leaf_key, leaf_info) in trunk.leaf_keys.iter().take(3) {
+                    for depth in [1u8, 2, 4] {
+                        let branch_query =
+                            PathBranchChunkQuery::new(query.path.clone(), leaf_key.clone(), depth);
+                        let Ok(branch_proof) =
+                            db.prove_branch_chunk(&branch_query, latest).unwrap()
+                        else {
+                            continue;
+                        };
+                        let mut proofs = mutations(&branch_proof);
+                        proofs.push(branch_proof);
+                        for p in &proofs {
+                            for expected in [leaf_info.hash, [9; 32]] {
+                                let got = GroveDb::verify_branch_chunk_proof(
+                                    p,
+                                    &branch_query,
+                                    expected,
+                                    latest,
+                                );
+                                let want = ref_verify_branch_chunk_proof(
+                                    p,
+                                    &branch_query,
+                                    expected,
+                                    latest,
+                                );
+                                assert_eq!(format!("{got:?}"), format!("{want:?}"));
+                                branch_cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(branch_cases > 100, "{branch_cases}");
+    }
+}
+
 /// `decode_chunk_ops` replaces `decoder.by_ref().collect()` in the chunk
 /// verifiers; it must return the same ops or error and leave the decoder
 /// in the same place.
@@ -5615,7 +6819,7 @@ mod chunk_decode_reference_tests {
 
     /// Byte-level mutations of one merk proof: flips at a stride, a
     /// truncation, an appended byte, and the empty proof.
-    fn mutations(bytes: &[u8]) -> Vec<Vec<u8>> {
+    pub(super) fn mutations(bytes: &[u8]) -> Vec<Vec<u8>> {
         let mut out = Vec::new();
         let stride = (bytes.len() / 40).max(1);
         let mut i = 0;

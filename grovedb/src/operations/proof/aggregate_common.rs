@@ -256,7 +256,10 @@ pub(in crate::operations::proof) fn verify_single_key_layer_proof_v0(
 /// Index of the first row whose key is `key`, or `rows.len()` if there is
 /// none: `rows.iter().position(|p| p.key == key)` as an index loop without a
 /// closure or an early return.
-fn first_row_with_key(rows: &[ProvedKeyOptionalValue], key: &[u8]) -> usize {
+pub(in crate::operations::proof) fn first_row_with_key(
+    rows: &[ProvedKeyOptionalValue],
+    key: &[u8],
+) -> usize {
     let mut i = 0;
     while i < rows.len() && rows[i].key.as_slice() != key {
         i += 1;
