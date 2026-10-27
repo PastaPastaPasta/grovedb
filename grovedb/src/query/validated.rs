@@ -13,7 +13,7 @@
 
 #[cfg(feature = "minimal")]
 use grovedb_version::error::GroveVersionError;
-use grovedb_version::version::GroveVersion;
+use grovedb_version::version::{FeatureVersion, GroveVersion};
 
 #[cfg(feature = "minimal")]
 use super::AggregateKind;
@@ -161,29 +161,22 @@ impl<'q> ValidatedPathQuery<'q> {
 
     fn check_proof_capabilities(&self, generating: bool) -> Result<(), Error> {
         let versions = &self.grove_version.grovedb_versions.operations.proof;
-        // Exhaustive over the shapes so adding one forces a deliberate
-        // capability-gate decision here (fail closed).
-        let message = match self.shape {
-            PathQueryShape::AxisRead { .. } | PathQueryShape::BranchedAxisRead { .. } => {
-                (versions.axis_descent_in_v1_envelope != 1).then_some(if generating {
-                    "axis-ordered descents in the V1 proof envelope are not emitted at this grove version"
-                } else {
-                    "axis-ordered descents in the V1 proof envelope are not accepted at this grove version"
-                })
-            }
-            PathQueryShape::SumBudget { .. } => {
-                (versions.sum_budget_in_v1_envelope != 1).then_some(if generating {
-                    "sum-budget windows in the V1 proof envelope are not emitted at this grove version"
-                } else {
-                    "sum-budget windows in the V1 proof envelope are not accepted at this grove version"
-                })
-            }
-            // Serving these shapes needs no capability slot beyond the
-            // envelope version itself.
-            PathQueryShape::KeySelection
-            | PathQueryShape::CountOffsetPaginated { .. }
-            | PathQueryShape::AggregateLeaf { .. }
-            | PathQueryShape::AggregateCarrier { .. } => None,
+        // Exhaustive over the shapes (in `capability_slot`) so adding one
+        // forces a deliberate capability-gate decision here (fail closed).
+        let message = match capability_slot(&self.shape) {
+            CapabilitySlot::AxisDescent => unsupported_message(
+                versions.axis_descent_in_v1_envelope,
+                generating,
+                "axis-ordered descents in the V1 proof envelope are not emitted at this grove version",
+                "axis-ordered descents in the V1 proof envelope are not accepted at this grove version",
+            ),
+            CapabilitySlot::SumBudget => unsupported_message(
+                versions.sum_budget_in_v1_envelope,
+                generating,
+                "sum-budget windows in the V1 proof envelope are not emitted at this grove version",
+                "sum-budget windows in the V1 proof envelope are not accepted at this grove version",
+            ),
+            CapabilitySlot::Unneeded => None,
         };
         match message {
             Some(message) => Err(Error::NotSupported(message.to_string())),
@@ -278,4 +271,160 @@ fn unknown_prove_version(received: u16) -> Error {
         known_versions: vec![0, 1],
         received,
     })
+}
+
+/// The proof capability slot a shape needs beyond the envelope version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilitySlot {
+    /// `proof.axis_descent_in_v1_envelope`.
+    AxisDescent,
+    /// `proof.sum_budget_in_v1_envelope`.
+    SumBudget,
+    /// Serving the shape needs no capability slot beyond the envelope
+    /// version itself.
+    Unneeded,
+}
+
+/// The capability slot `shape` needs. Exhaustive over the shapes so adding
+/// one forces a deliberate capability-gate decision (fail closed). A
+/// function of its own, so the extracted gate does not join inside the
+/// match on the borrowed shape.
+fn capability_slot(shape: &PathQueryShape<'_>) -> CapabilitySlot {
+    match shape {
+        PathQueryShape::AxisRead { .. } | PathQueryShape::BranchedAxisRead { .. } => {
+            CapabilitySlot::AxisDescent
+        }
+        PathQueryShape::SumBudget { .. } => CapabilitySlot::SumBudget,
+        PathQueryShape::KeySelection
+        | PathQueryShape::CountOffsetPaginated { .. }
+        | PathQueryShape::AggregateLeaf { .. }
+        | PathQueryShape::AggregateCarrier { .. } => CapabilitySlot::Unneeded,
+    }
+}
+
+/// The refusal message for a capability slot at `version`: `None` when the
+/// slot is served (`version == 1`), else the message for generating or for
+/// verifying. Plain `if`/`else`: the extraction does not translate
+/// `bool::then_some`.
+fn unsupported_message(
+    version: FeatureVersion,
+    generating: bool,
+    emitted: &'static str,
+    accepted: &'static str,
+) -> Option<&'static str> {
+    if version != 1 {
+        if generating {
+            Some(emitted)
+        } else {
+            Some(accepted)
+        }
+    } else {
+        None
+    }
+}
+
+/// `check_proof_capabilities` now chooses its message through
+/// `capability_slot` and `unsupported_message`. `ref_message` is the
+/// previous `match`, verbatim except that it takes the shape and the
+/// version as parameters. Every shape is checked under every combination
+/// of the two capability slots, generating and verifying.
+#[cfg(test)]
+mod capability_reference_tests {
+    use grovedb_merk::proofs::query::{
+        query_item::QueryItem, AxisProjection, AxisQuery, AxisTraversal, IndexAxis, SumBudgetRead,
+    };
+
+    use super::*;
+
+    fn ref_message(
+        shape: PathQueryShape<'_>,
+        grove_version: &GroveVersion,
+        generating: bool,
+    ) -> Option<&'static str> {
+        let versions = &grove_version.grovedb_versions.operations.proof;
+        match shape {
+            PathQueryShape::AxisRead { .. } | PathQueryShape::BranchedAxisRead { .. } => {
+                (versions.axis_descent_in_v1_envelope != 1).then_some(if generating {
+                    "axis-ordered descents in the V1 proof envelope are not emitted at this grove version"
+                } else {
+                    "axis-ordered descents in the V1 proof envelope are not accepted at this grove version"
+                })
+            }
+            PathQueryShape::SumBudget { .. } => {
+                (versions.sum_budget_in_v1_envelope != 1).then_some(if generating {
+                    "sum-budget windows in the V1 proof envelope are not emitted at this grove version"
+                } else {
+                    "sum-budget windows in the V1 proof envelope are not accepted at this grove version"
+                })
+            }
+            PathQueryShape::KeySelection
+            | PathQueryShape::CountOffsetPaginated { .. }
+            | PathQueryShape::AggregateLeaf { .. }
+            | PathQueryShape::AggregateCarrier { .. } => None,
+        }
+    }
+
+    #[test]
+    fn capability_messages_match_reference() {
+        let item = QueryItem::Key(b"k".to_vec());
+        let items = [item.clone()];
+        let suffix = [b"s".to_vec()];
+        let axis = AxisQuery {
+            axis: IndexAxis::Count,
+            traversal: AxisTraversal::RankedPage { k: 1, offset: 0 },
+            descending: false,
+            projection: AxisProjection::Entries,
+        };
+        let budget = SumBudgetRead {
+            sum_limit: 1,
+            match_limit: None,
+        };
+        let query = PathQuery::new_single_key(vec![], b"k".to_vec());
+        let shapes = [
+            PathQueryShape::KeySelection,
+            PathQueryShape::CountOffsetPaginated { inner: &item },
+            PathQueryShape::AggregateLeaf {
+                kind: AggregateKind::Count,
+                inner: &item,
+            },
+            PathQueryShape::AggregateCarrier {
+                kind: AggregateKind::Sum,
+                inner: &item,
+            },
+            PathQueryShape::AxisRead { axis: &axis },
+            PathQueryShape::BranchedAxisRead {
+                branch_items: &items,
+                suffix: &suffix,
+                axis: &axis,
+            },
+            PathQueryShape::SumBudget {
+                budget: &budget,
+                items: &items,
+            },
+        ];
+        for shape in shapes {
+            for axis_slot in 0..3 {
+                for sum_slot in 0..3 {
+                    let mut grove_version = GroveVersion::latest().clone();
+                    let proof = &mut grove_version.grovedb_versions.operations.proof;
+                    proof.axis_descent_in_v1_envelope = axis_slot;
+                    proof.sum_budget_in_v1_envelope = sum_slot;
+                    let validated = ValidatedPathQuery {
+                        query: &query,
+                        shape,
+                        grove_version: &grove_version,
+                    };
+                    for generating in [false, true] {
+                        let got = match validated.check_proof_capabilities(generating) {
+                            Ok(()) => None,
+                            Err(e) => Some(format!("{e:?}")),
+                        };
+                        let want = ref_message(shape, &grove_version, generating)
+                            .map(|m| format!("{:?}", Error::NotSupported(m.to_string())));
+                        assert_eq!(got, want, "{shape:?} {axis_slot} {sum_slot} {generating}");
+                    }
+                }
+            }
+        }
+    }
 }
