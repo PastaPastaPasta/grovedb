@@ -121,13 +121,12 @@ impl GroveDb {
         let inner_range = path_query.validate_leaf_aggregate_sum_on_range()?.clone();
 
         let grovedb_proof = super::decode_grovedb_proof_canonical(proof)?;
-        let path_keys: Vec<&[u8]> = path_query.path.iter().map(|p| p.as_slice()).collect();
 
         let root_layer = require_v1_envelope(&grovedb_proof, path_query)?;
         leaf_chain::verify_v1_leaf_chain(
             root_layer,
             path_query,
-            &path_keys,
+            &path_query.path,
             0,
             &inner_range,
             grove_version,
@@ -245,13 +244,12 @@ fn verify_per_key(
     let classification = classification::classify_aggregate_sum_path_query(path_query)?;
 
     let grovedb_proof = super::decode_grovedb_proof_canonical(proof)?;
-    let path_keys: Vec<&[u8]> = path_query.path.iter().map(|p| p.as_slice()).collect();
 
     let root_layer = require_v1_envelope(&grovedb_proof, path_query)?;
     per_key::verify_v1_with_classification(
         root_layer,
         path_query,
-        &path_keys,
+        &path_query.path,
         &classification,
         limit_mode,
         grove_version,

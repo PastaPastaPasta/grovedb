@@ -33,7 +33,7 @@ use crate::{
 pub(super) fn verify_v1_leaf_chain(
     layer: &LayerProof,
     path_query: &PathQuery,
-    path_keys: &[&[u8]],
+    path_keys: &[Vec<u8>],
     depth: usize,
     inner_range: &QueryItem,
     grove_version: &GroveVersion,

@@ -32,7 +32,7 @@ use crate::{
 pub(super) fn verify_v1_with_classification(
     layer: &LayerProof,
     path_query: &PathQuery,
-    path_keys: &[&[u8]],
+    path_keys: &[Vec<u8>],
     classification: &AggregateCountClassification,
     limit_mode: ProofLimitMode,
     grove_version: &GroveVersion,
@@ -56,7 +56,7 @@ pub(super) fn verify_v1_with_classification(
 fn verify_v1_per_key(
     layer: &LayerProof,
     path_query: &PathQuery,
-    path_keys: &[&[u8]],
+    path_keys: &[Vec<u8>],
     depth: usize,
     classification: &AggregateCountClassification,
     limit_mode: ProofLimitMode,
