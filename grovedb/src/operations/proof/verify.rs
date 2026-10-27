@@ -5156,14 +5156,8 @@ impl GroveDb {
 
         // Check for inconsistent depth: if one child is Hash and the other exists
         // but is not Hash, the proof has inconsistent truncation depth
-        let left_is_hash = tree
-            .left
-            .as_ref()
-            .map(|c| matches!(c.tree.node, Node::Hash(_)));
-        let right_is_hash = tree
-            .right
-            .as_ref()
-            .map(|c| matches!(c.tree.node, Node::Hash(_)));
+        let left_is_hash = child_is_hash(&tree.left);
+        let right_is_hash = child_is_hash(&tree.right);
 
         // If both children exist, they must both be Hash or both be non-Hash
         if let (Some(left_hash), Some(right_hash)) = (left_is_hash, right_is_hash)
@@ -5177,15 +5171,10 @@ impl GroveDb {
         }
 
         // Extract key and value from this node - must exist for valid trunk proofs
-        let (key, value) = Self::get_key_value_from_node(&tree.node).ok_or_else(|| {
-            Error::InvalidProof(
-                PathQuery::new_unsized(Vec::new(), Query::default()),
-                format!(
-                    "Trunk proof contains node without key/value data: {:?}",
-                    tree.node
-                ),
-            )
-        })?;
+        let (key, value) = match Self::get_key_value_from_node(&tree.node) {
+            Some(key_value) => key_value,
+            None => return Err(chunk_node_without_key_value(&tree.node)),
+        };
 
         let element = Element::deserialize(&value, grove_version)?;
 
@@ -5197,7 +5186,7 @@ impl GroveDb {
         elements.insert(key.clone(), element);
 
         // Check if this node has Hash children (making it a leaf)
-        let has_hash_child = left_is_hash.unwrap_or(false) || right_is_hash.unwrap_or(false);
+        let has_hash_child = either_child_is_hash(left_is_hash, right_is_hash);
 
         if has_hash_child {
             // Store the node's hash and count as LeafInfo for branch queries.
@@ -5327,10 +5316,15 @@ impl GroveDb {
     ) -> Result<crate::query::GroveBranchQueryResult, Error> {
         // Decode the proof ops
         let mut decoder = Decoder::new(proof);
-        let ops: Vec<Op> = decoder
-            .by_ref()
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| Error::CorruptedData(format!("Failed to decode branch proof: {}", e)))?;
+        let ops = match decode_chunk_ops(&mut decoder) {
+            Ok(ops) => ops,
+            Err(e) => {
+                return Err(Error::CorruptedData(format!(
+                    "Failed to decode branch proof: {}",
+                    e
+                )));
+            }
+        };
         if decoder.remaining_bytes() > 0 {
             return Err(Error::CorruptedData(format!(
                 "Branch proof has {} unconsumed trailing bytes",
@@ -5340,14 +5334,15 @@ impl GroveDb {
 
         // Execute the proof to build the tree structure and get its root hash
         // Use collapse=false to preserve the full tree structure for element extraction
-        let branch_tree = execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))
-            .unwrap()
-            .map_err(|e| {
-                Error::InvalidProof(
+        let branch_tree = match execute_chunk_ops(&ops).unwrap() {
+            Ok(branch_tree) => branch_tree,
+            Err(e) => {
+                return Err(Error::InvalidProof(
                     PathQuery::new_unsized(query.path.clone(), Query::default()),
                     format!("Failed to execute branch proof: {}", e),
-                )
-            })?;
+                ));
+            }
+        };
 
         let branch_root_hash = branch_tree.hash().unwrap();
 
@@ -5382,6 +5377,104 @@ impl GroveDb {
             tree: branch_tree,
         })
     }
+}
+
+/// Every op of a chunk proof, decoded in order, stopping at the first
+/// decoding error: `decoder.by_ref().collect::<Result<Vec<Op>, _>>()` as a
+/// loop (the extraction has no model of `collect`). The decoder is left
+/// where `collect` would leave it, for the trailing-bytes check.
+fn decode_chunk_ops(decoder: &mut Decoder<'_>) -> Result<Vec<Op>, grovedb_merk::Error> {
+    let mut ops = Vec::new();
+    let mut failure = None;
+    let mut done = false;
+    while !done {
+        match decoder.next() {
+            Some(Ok(op)) => ops.push(op),
+            Some(Err(e)) => {
+                failure = Some(e);
+                done = true;
+            }
+            None => done = true,
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(ops),
+    }
+}
+
+/// Clones of `ops` in order, each wrapped in `Ok`: the
+/// `ops.iter().map(|op| Ok(op.clone()))` the chunk verifiers executed, as
+/// a named iterator.
+struct ClonedChunkOps<'a> {
+    ops: &'a [Op],
+    next: usize,
+}
+
+impl Iterator for ClonedChunkOps<'_> {
+    type Item = Result<Op, grovedb_merk::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next < self.ops.len() {
+            let op = self.ops[self.next].clone();
+            self.next += 1;
+            Some(Ok(op))
+        } else {
+            None
+        }
+    }
+}
+
+/// The node visitor of a chunk proof's execution: accepts every node (the
+/// `|_| Ok(())` the chunk verifiers passed).
+struct AcceptEveryNode;
+
+impl grovedb_merk::proofs::tree::NodeVisitor for AcceptEveryNode {
+    fn visit_node(&mut self, _node: &Node) -> Result<(), grovedb_merk::Error> {
+        Ok(())
+    }
+}
+
+/// Execute a chunk proof's ops without collapsing, with the AVL balance
+/// check: `execute(ops.iter().map(|op| Ok(op.clone())), false, |_| Ok(()))`
+/// (which is `execute_with_visitor(.., false, true, ..)`), without closures.
+fn execute_chunk_ops(
+    ops: &[Op],
+) -> grovedb_costs::CostResult<grovedb_merk::proofs::tree::Tree, grovedb_merk::Error> {
+    let mut cloned = ClonedChunkOps { ops, next: 0 };
+    grovedb_merk::proofs::tree::execute_with_visitor(&mut cloned, false, true, &mut AcceptEveryNode)
+}
+
+/// Whether a chunk-proof child is a `Node::Hash`, `None` without a child
+/// (`child.as_ref().map(|c| matches!(c.tree.node, Node::Hash(_)))`).
+#[allow(clippy::manual_map)] // `Option::map` with a closure is what this avoids
+fn child_is_hash(child: &Option<grovedb_merk::proofs::tree::Child>) -> Option<bool> {
+    match child {
+        Some(c) => Some(matches!(c.tree.node, Node::Hash(_))),
+        None => None,
+    }
+}
+
+/// Whether either child is a `Node::Hash`
+/// (`left.unwrap_or(false) || right.unwrap_or(false)`). A function of its
+/// own so the extracted chunk walk does not join on the `||` of two
+/// `unwrap_or`s.
+fn either_child_is_hash(left: Option<bool>, right: Option<bool>) -> bool {
+    matches!(left, Some(true)) || matches!(right, Some(true))
+}
+
+/// The error for a chunk-proof node with no key/value data. Error
+/// construction only (the node's `Debug` text), out of line and `#[cold]`;
+/// the extraction treats it as opaque.
+#[cold]
+fn chunk_node_without_key_value(node: &Node) -> Error {
+    Error::InvalidProof(
+        PathQuery::new_unsized(Vec::new(), Query::default()),
+        format!(
+            "Trunk proof contains node without key/value data: {:?}",
+            node
+        ),
+    )
 }
 
 /// The `total_count` of the append-only element the single-key subset
@@ -5511,6 +5604,59 @@ fn be_u64(bytes: &[u8]) -> Option<u64> {
         i += 1;
     }
     Some(value)
+}
+
+/// `decode_chunk_ops` replaces `decoder.by_ref().collect()` in the chunk
+/// verifiers; it must return the same ops or error and leave the decoder
+/// in the same place.
+#[cfg(test)]
+mod chunk_decode_reference_tests {
+    use super::*;
+
+    /// Byte-level mutations of one merk proof: flips at a stride, a
+    /// truncation, an appended byte, and the empty proof.
+    fn mutations(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let stride = (bytes.len() / 40).max(1);
+        let mut i = 0;
+        while i < bytes.len() {
+            let mut m = bytes.to_vec();
+            m[i] ^= 0x01;
+            out.push(m);
+            let mut m = bytes.to_vec();
+            m[i] = 0xff;
+            out.push(m);
+            i += stride;
+        }
+        out.push(bytes[..bytes.len() / 2].to_vec());
+        let mut m = bytes.to_vec();
+        m.push(0);
+        out.push(m);
+        out.push(Vec::new());
+        out
+    }
+
+    #[test]
+    fn decode_chunk_ops_matches_collect() {
+        let mut ops_bytes = Vec::new();
+        grovedb_merk::proofs::encoding::encode_into(
+            [
+                Op::Push(Node::Hash([1; 32])),
+                Op::Push(Node::KV(b"k".to_vec(), b"v".to_vec())),
+                Op::Parent,
+            ]
+            .iter(),
+            &mut ops_bytes,
+        );
+        for bytes in mutations(&ops_bytes).into_iter().chain([ops_bytes.clone()]) {
+            let mut a = Decoder::new(&bytes);
+            let got = decode_chunk_ops(&mut a);
+            let mut b = Decoder::new(&bytes);
+            let want: Result<Vec<Op>, _> = b.by_ref().collect();
+            assert_eq!(format!("{got:?}"), format!("{want:?}"));
+            assert_eq!(a.remaining_bytes(), b.remaining_bytes());
+        }
+    }
 }
 
 /// The bulk position-range row checks were lifted out of
