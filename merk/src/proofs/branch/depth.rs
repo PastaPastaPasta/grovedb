@@ -191,11 +191,11 @@ pub fn calculate_chunk_depths(tree_depth: u8, max_depth: u8) -> Result<Vec<u8>, 
     }
 
     if tree_depth == 0 {
-        return Ok(vec![0]);
+        return Ok(single_chunk(0));
     }
 
     if tree_depth <= max_depth {
-        return Ok(vec![tree_depth]);
+        return Ok(single_chunk(tree_depth));
     }
 
     // Calculate number of chunks needed: ceil(tree_depth / max_depth)
@@ -207,20 +207,81 @@ pub fn calculate_chunk_depths(tree_depth: u8, max_depth: u8) -> Result<Vec<u8>, 
 
     // Distribute remainder across chunks for even distribution
     // Higher depth chunks come first (they represent higher tree levels)
-    Ok((0..num_chunks)
-        .map(|i| {
-            if i < remainder {
-                (base_depth + 1) as u8
-            } else {
-                base_depth as u8
-            }
-        })
-        .collect())
+    // An index loop rather than `(0..num_chunks).map(..).collect()`, to keep
+    // closures and iterator adapters off the verifier path.
+    let mut chunks = Vec::with_capacity(num_chunks as usize);
+    let mut i = 0;
+    while i < num_chunks {
+        chunks.push(if i < remainder {
+            (base_depth + 1) as u8
+        } else {
+            base_depth as u8
+        });
+        i += 1;
+    }
+    Ok(chunks)
+}
+
+/// A one-chunk plan of `depth`: `vec![depth]`, built with `push` because the
+/// Rust-to-Lean extraction does not translate that `vec![..]`.
+#[allow(clippy::vec_init_then_push)]
+fn single_chunk(depth: u8) -> Vec<u8> {
+    let mut chunks = Vec::with_capacity(1);
+    chunks.push(depth);
+    chunks
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The previous `calculate_chunk_depths`, verbatim except for its name
+    /// (reshaped for the Rust-to-Lean extraction).
+    fn ref_calculate_chunk_depths(tree_depth: u8, max_depth: u8) -> Result<Vec<u8>, Error> {
+        if max_depth == 0 {
+            return Err(Error::InvalidInputError("max_depth must be > 0"));
+        }
+
+        if tree_depth == 0 {
+            return Ok(vec![0]);
+        }
+
+        if tree_depth <= max_depth {
+            return Ok(vec![tree_depth]);
+        }
+
+        // Calculate number of chunks needed: ceil(tree_depth / max_depth)
+        let num_chunks = (tree_depth as u32).div_ceil(max_depth as u32);
+
+        // Calculate base depth per chunk and remainder
+        let base_depth = (tree_depth as u32) / num_chunks;
+        let remainder = (tree_depth as u32) % num_chunks;
+
+        // Distribute remainder across chunks for even distribution
+        // Higher depth chunks come first (they represent higher tree levels)
+        Ok((0..num_chunks)
+            .map(|i| {
+                if i < remainder {
+                    (base_depth + 1) as u8
+                } else {
+                    base_depth as u8
+                }
+            })
+            .collect())
+    }
+
+    #[test]
+    fn calculate_chunk_depths_matches_reference_exhaustively() {
+        for tree_depth in 0..=u8::MAX {
+            for max_depth in 0..=u8::MAX {
+                assert_eq!(
+                    format!("{:?}", calculate_chunk_depths(tree_depth, max_depth)),
+                    format!("{:?}", ref_calculate_chunk_depths(tree_depth, max_depth)),
+                    "{tree_depth} {max_depth}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_calculate_tree_depth_from_count_edge_cases() {
