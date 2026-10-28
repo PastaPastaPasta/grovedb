@@ -4609,24 +4609,24 @@ impl GroveDb {
     ///   keys, chunk depths, and tree depth
     pub fn verify_trunk_chunk_proof(
         proof: &[u8],
-        query: &PathTrunkChunkQuery,
+        chunk_query: &PathTrunkChunkQuery,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
         let grovedb_proof = super::decode_grovedb_proof_canonical(proof)?;
 
         match grovedb_proof {
             GroveDBProof::V0(proof_v0) => {
-                Self::verify_trunk_chunk_proof_v0(&proof_v0, query, grove_version)
+                Self::verify_trunk_chunk_proof_v0(&proof_v0, chunk_query, grove_version)
             }
             GroveDBProof::V1(proof_v1) => {
-                Self::verify_trunk_chunk_proof_v1(&proof_v1, query, grove_version)
+                Self::verify_trunk_chunk_proof_v1(&proof_v1, chunk_query, grove_version)
             }
         }
     }
 
     fn verify_trunk_chunk_proof_v0(
         proof: &GroveDBProofV0,
-        query: &PathTrunkChunkQuery,
+        chunk_query: &PathTrunkChunkQuery,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
         // Collect layer info as we walk down the path for later verification
@@ -4643,11 +4643,11 @@ impl GroveDb {
         let mut failure = None;
         let mut failed = false;
         let mut i = 0;
-        while i < query.path.len() && !failed {
-            let is_last = i == query.path.len() - 1;
+        while i < chunk_query.path.len() && !failed {
+            let is_last = i == chunk_query.path.len() - 1;
             match Self::trunk_path_layer_v0(
                 current_layer,
-                &query.path[i],
+                &chunk_query.path[i],
                 i,
                 is_last,
                 &current_path,
@@ -4664,7 +4664,7 @@ impl GroveDb {
                     }
                     layer_infos.push(layer_info);
                     current_layer = lower_layer;
-                    current_path.push(query.path[i].clone());
+                    current_path.push(chunk_query.path[i].clone());
                 }
                 Err(e) => {
                     failure = Some(e);
@@ -4717,7 +4717,7 @@ impl GroveDb {
         }
 
         let tree_depth = calculate_max_tree_depth_from_count(count);
-        let chunk_depths = match calculate_chunk_depths(tree_depth, query.max_depth) {
+        let chunk_depths = match calculate_chunk_depths(tree_depth, chunk_query.max_depth) {
             Ok(chunk_depths) => chunk_depths,
             Err(e) => {
                 return Err(Error::CorruptedData(format!(
@@ -4927,10 +4927,10 @@ impl GroveDb {
     /// which would let the V0 fast-path skip the hash verification.
     fn verify_trunk_chunk_proof_v1(
         proof: &GroveDBProofV1,
-        query: &PathTrunkChunkQuery,
+        chunk_query: &PathTrunkChunkQuery,
         grove_version: &GroveVersion,
     ) -> Result<(CryptoHash, GroveTrunkQueryResult), Error> {
-        if query.path.is_empty() {
+        if chunk_query.path.is_empty() {
             return Err(Error::InvalidProof(
                 PathQuery::new_unsized(Vec::new(), Query::default()),
                 "V1 trunk: empty path - no root hash computed".to_string(),
@@ -4951,11 +4951,11 @@ impl GroveDb {
         let mut failure = None;
         let mut failed = false;
         let mut i = 0;
-        while i < query.path.len() && !failed {
-            let is_last = i == query.path.len() - 1;
+        while i < chunk_query.path.len() && !failed {
+            let is_last = i == chunk_query.path.len() - 1;
             match Self::trunk_path_layer_v1(
                 current_layer,
-                &query.path[i],
+                &chunk_query.path[i],
                 i,
                 is_last,
                 &current_path,
@@ -4970,7 +4970,7 @@ impl GroveDb {
                     }
                     layer_infos.push(layer_info);
                     current_layer = lower_layer;
-                    current_path.push(query.path[i].clone());
+                    current_path.push(chunk_query.path[i].clone());
                 }
                 Err(e) => {
                     failure = Some(e);
@@ -5009,7 +5009,7 @@ impl GroveDb {
         // Determine the lower hash -- always computed, even for empty trees.
         // This is the critical security fix: V0 skipped this for count==0.
         let (lower_hash, target_tree_opt) =
-            Self::trunk_target_v1(target_merk_bytes, count, query, &current_path)?;
+            Self::trunk_target_v1(target_merk_bytes, count, chunk_query, &current_path)?;
 
         // ALWAYS verify the cryptographic chain from trunk up through all layers.
         // This is the security fix: V0 skipped this when count==0, allowing
@@ -5034,7 +5034,7 @@ impl GroveDb {
         // Non-empty tree: extract elements
         let target_tree = target_tree_opt.unwrap();
         let tree_depth = calculate_max_tree_depth_from_count(count);
-        let chunk_depths = match calculate_chunk_depths(tree_depth, query.max_depth) {
+        let chunk_depths = match calculate_chunk_depths(tree_depth, chunk_query.max_depth) {
             Ok(chunk_depths) => chunk_depths,
             Err(e) => {
                 return Err(Error::CorruptedData(format!(
@@ -5408,7 +5408,7 @@ impl GroveDb {
     /// - The verified branch root hash
     pub fn verify_branch_chunk_proof(
         proof: &[u8],
-        query: &crate::query::PathBranchChunkQuery,
+        chunk_query: &crate::query::PathBranchChunkQuery,
         expected_root_hash: CryptoHash,
         grove_version: &GroveVersion,
     ) -> Result<crate::query::GroveBranchQueryResult, Error> {
@@ -5436,7 +5436,7 @@ impl GroveDb {
             Ok(branch_tree) => branch_tree,
             Err(e) => {
                 return Err(Error::InvalidProof(
-                    PathQuery::new_unsized(query.path.clone(), Query::default()),
+                    PathQuery::new_unsized(chunk_query.path.clone(), Query::default()),
                     format!("Failed to execute branch proof: {}", e),
                 ));
             }
@@ -5447,7 +5447,7 @@ impl GroveDb {
         // Verify the computed hash matches the expected hash from the parent proof
         if branch_root_hash != expected_root_hash {
             return Err(Error::InvalidProof(
-                PathQuery::new_unsized(query.path.clone(), Query::default()),
+                PathQuery::new_unsized(chunk_query.path.clone(), Query::default()),
                 format!(
                     "Branch root hash mismatch: expected {}, got {}",
                     hex::encode(expected_root_hash),
@@ -5464,7 +5464,7 @@ impl GroveDb {
             &mut elements,
             &mut leaf_keys,
             0,
-            query.depth as usize,
+            chunk_query.depth as usize,
             grove_version,
         )?;
 
