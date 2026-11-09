@@ -18,6 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `insert.validate_indexed_child_for_variant` slot (**BREAKING** for code
   building `GroveDBOperationsInsertVersions` by hand); a wrapped `SumItem`
   stays refused at every version.
+- **BREAKING**: with the `sqlite` feature, `grovedb-commitment-tree` now
+  depends on and re-exports rusqlite 0.41 (libsqlite3-sys 0.39), up from
+  0.38. With the bundled SQLite (3.54) this clears RUSTSEC-2026-0459; builds
+  that enable `bundled-sqlcipher` or link a system SQLite need their own
+  check against the advisory. Callers that pass their own `Connection` to
+  `ClientPersistentCommitmentTree::open` or `open_on_shared_connection`, or
+  to `SqliteShardStore::new` or `new_shared`, must build it with rusqlite
+  0.41. Because libsqlite3-sys declares `links = "sqlite3"`, a build can
+  hold only one version of it, so other rusqlite users in the same build
+  must move to 0.41 as well.
 
 ### Added
 - `ProofLimitMode::UpperBound` and `QueryProofVerify::execute_proof_with_limit_mode`
